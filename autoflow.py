@@ -10,7 +10,7 @@ import copy
 
 DATA_FILE = "autoflow_tasks.json"
 
-ACTION_TYPES = ["Click", "Input", "Scroll", "Typewrite"]
+ACTION_TYPES = ["Click", "Input", "Scroll", "Typewrite", "Press Enter"]
 
 COLORS = {
     "bg": "#1e1e2e",
@@ -31,6 +31,7 @@ COLORS = {
     "loop_accent": "#fab387",
     "pause_bg": "#45475a",
     "pause_fg": "#f9e2af",
+    "enter_accent": "#94e2d5",
 }
 
 pyautogui.FAILSAFE = True
@@ -51,53 +52,35 @@ class AutoPauseManager:
                           →  STOPPED
     """
 
-    # Mouse-movement threshold (pixels) to trigger auto-pause
     MOUSE_MOVE_THRESHOLD = 80
-    # How long (sec) to watch for continued user activity before retrigger
     MOUSE_CHECK_INTERVAL = 0.4
-    # After auto-pause: how many seconds of inactivity before auto-resume
     AUTO_RESUME_IDLE_SECS = 2.5
-    # Radius (px) around an automation click coord – ignored as user movement
     AUTOMATION_AREA_RADIUS = 60
-    # Max movement history samples for direction-change analysis
     MAX_HISTORY = 6
 
     def __init__(self, on_status_update, root_widget):
-        """
-        Args:
-            on_status_update : callable(str)  – updates status label
-            root_widget      : tk root/widget – for thread-safe .after() calls
-        """
         self.on_status_update = on_status_update
         self.root = root_widget
 
-        # Threading events
-        self.pause_event = threading.Event()    # set  → paused
-        self.resume_event = threading.Event()   # set  → may continue
-        self.stop_event = threading.Event()     # set  → abort
-        self.resume_event.set()                 # default: not paused
+        self.pause_event = threading.Event()
+        self.resume_event = threading.Event()
+        self.stop_event = threading.Event()
+        self.resume_event.set()
 
-        # State flags (mirrors uniapp PauseManager)
         self.manual_pause_active = False
         self.auto_pause_active = False
         self.force_pause_mode = False
         self.pause_timestamp = None
 
-        # Mouse monitor state
         self.last_mouse_pos = None
         self.automation_running = False
         self._monitor_thread = None
-        self._known_automation_coords = []   # list of (x,y) tuples from current task
+        self._known_automation_coords = []
 
-        # Keyboard monitor state
         self._kb_monitor_thread = None
         self._last_kb_time = 0
 
-    # ------------------------------------------------------------------
-    # Public control API
-    # ------------------------------------------------------------------
     def start(self, automation_coords=None):
-        """Call when automation begins."""
         self.stop_event.clear()
         self.pause_event.clear()
         self.resume_event.set()
@@ -109,16 +92,14 @@ class AutoPauseManager:
         self._start_keyboard_monitor()
 
     def stop(self):
-        """Call to permanently stop automation."""
         self.stop_event.set()
         self.pause_event.clear()
-        self.resume_event.set()   # unblock any waiting threads
+        self.resume_event.set()
         self.automation_running = False
         self.manual_pause_active = False
         self.auto_pause_active = False
 
     def manual_pause(self):
-        """User explicitly paused – strongest lock, auto-resume won't clear it."""
         if self.stop_event.is_set():
             return
         self.manual_pause_active = True
@@ -127,10 +108,9 @@ class AutoPauseManager:
         self.pause_timestamp = time.time()
         self.resume_event.clear()
         self.pause_event.set()
-        self.on_status_update("⏸ Paused manually")
+        self.on_status_update("\u23f8 Paused manually")
 
     def manual_resume(self):
-        """User explicitly resumed."""
         if self.stop_event.is_set():
             return
         self.manual_pause_active = False
@@ -138,64 +118,47 @@ class AutoPauseManager:
         self.force_pause_mode = False
         self.pause_event.clear()
         self.resume_event.set()
-        self.on_status_update("▶ Resumed")
+        self.on_status_update("\u25b6 Resumed")
 
     def auto_pause(self, reason="User activity detected"):
-        """Called internally when mouse/keyboard activity is sensed."""
         if self.stop_event.is_set() or self.manual_pause_active:
             return
         if self.auto_pause_active:
-            return  # already auto-paused
+            return
         self.auto_pause_active = True
         self.pause_timestamp = time.time()
         self.resume_event.clear()
         self.pause_event.set()
-        self.on_status_update(f"⚡ Auto-paused: {reason}")
-        # Schedule auto-resume watcher
+        self.on_status_update(f"\u26a1 Auto-paused: {reason}")
         t = threading.Thread(target=self._auto_resume_watcher, daemon=True)
         t.start()
 
     def _auto_resume_watcher(self):
-        """
-        After an auto-pause, watch mouse position for inactivity.
-        If mouse is idle for AUTO_RESUME_IDLE_SECS, resume automatically.
-        But if user has manually paused in the meantime, do not resume.
-        """
         last_pos = pyautogui.position()
         while not self.stop_event.is_set():
             time.sleep(0.3)
             if self.stop_event.is_set():
                 break
             if self.manual_pause_active:
-                # Manual pause took over – watcher exits without resuming
                 break
             if not self.auto_pause_active:
                 break
             current_pos = pyautogui.position()
             dx = current_pos.x - last_pos.x
             dy = current_pos.y - last_pos.y
-            if (dx**2 + dy**2)**0.5 < 5:   # mouse is still
+            if (dx**2 + dy**2)**0.5 < 5:
                 elapsed = time.time() - (self.pause_timestamp or time.time())
                 if elapsed >= self.AUTO_RESUME_IDLE_SECS:
-                    # Safe to auto-resume
                     self.auto_pause_active = False
                     self.pause_event.clear()
                     self.resume_event.set()
-                    self.on_status_update("▶ Auto-resumed (user idle)")
+                    self.on_status_update("\u25b6 Auto-resumed (user idle)")
                     break
             else:
-                # User still moving – reset timer
                 self.pause_timestamp = time.time()
                 last_pos = current_pos
 
-    # ------------------------------------------------------------------
-    # Wait helper (used by execution engine between steps)
-    # ------------------------------------------------------------------
     def wait_if_paused(self):
-        """
-        Block the caller (automation thread) while paused.
-        Returns False if stop was requested, True otherwise.
-        """
         while self.pause_event.is_set() and not self.stop_event.is_set():
             time.sleep(0.1)
         return not self.stop_event.is_set()
@@ -208,9 +171,6 @@ class AutoPauseManager:
     def is_stopped(self):
         return self.stop_event.is_set()
 
-    # ------------------------------------------------------------------
-    # Mouse monitor  (adapted from uniapp/improved_mouse_monitor.py)
-    # ------------------------------------------------------------------
     def _start_mouse_monitor(self):
         self._monitor_thread = threading.Thread(
             target=self._mouse_monitor_loop, daemon=True)
@@ -234,7 +194,6 @@ class AutoPauseManager:
                     dy = current_pos.y - self.last_mouse_pos.y
                     distance = (dx**2 + dy**2)**0.5
 
-                    # Maintain movement history
                     if len(movement_history) >= self.MAX_HISTORY:
                         movement_history.pop(0)
                     movement_history.append((current_time, distance, dx, dy))
@@ -242,7 +201,6 @@ class AutoPauseManager:
                     is_user_movement = False
 
                     if distance > self.MOUSE_MOVE_THRESHOLD:
-                        # Check if near any known automation coordinate
                         near_auto = False
                         for ax, ay in self._known_automation_coords:
                             d = ((current_pos.x - ax)**2 + (current_pos.y - ay)**2)**0.5
@@ -253,7 +211,6 @@ class AutoPauseManager:
                         if not near_auto:
                             is_user_movement = True
 
-                        # Direction-change pattern = human movement
                         if len(movement_history) >= 3:
                             direction_changes = 0
                             prev_dx, prev_dy = 0, 0
@@ -267,7 +224,7 @@ class AutoPauseManager:
                     if is_user_movement:
                         self.root.after(0, lambda: self.auto_pause("Mouse movement"))
                         self.last_mouse_pos = current_pos
-                        time.sleep(1.5)   # debounce
+                        time.sleep(1.5)
                         continue
 
                 self.last_mouse_pos = current_pos
@@ -275,31 +232,23 @@ class AutoPauseManager:
             except Exception:
                 pass
 
-            # Interruptible sleep
             for _ in range(int(self.MOUSE_CHECK_INTERVAL / 0.05)):
                 if self.stop_event.is_set():
                     break
                 time.sleep(0.05)
 
-    # ------------------------------------------------------------------
-    # Keyboard monitor
-    # ------------------------------------------------------------------
     def _start_keyboard_monitor(self):
         self._kb_monitor_thread = threading.Thread(
             target=self._keyboard_monitor_loop, daemon=True)
         self._kb_monitor_thread.start()
 
     def _keyboard_monitor_loop(self):
-        """
-        Monitors keyboard activity via pynput if available, otherwise
-        falls back to a lightweight polling approach using ctypes on Windows.
-        """
         try:
             from pynput import keyboard as pynput_kb
 
             def on_press(key):
                 if self.stop_event.is_set():
-                    return False  # stop listener
+                    return False
                 if (self.automation_running
                         and not self.pause_event.is_set()
                         and not self.manual_pause_active):
@@ -311,14 +260,12 @@ class AutoPauseManager:
                 listener.stop()
 
         except ImportError:
-            # pynput not installed – use ctypes polling (Windows only)
             self._keyboard_monitor_ctypes()
 
     def _keyboard_monitor_ctypes(self):
-        """Fallback keyboard monitor using ctypes GetAsyncKeyState (Windows)."""
         try:
             import ctypes
-            MONITORED_KEYS = list(range(0x08, 0x90))  # most common VK codes
+            MONITORED_KEYS = list(range(0x08, 0x90))
             prev_state = {k: False for k in MONITORED_KEYS}
 
             while not self.stop_event.is_set():
@@ -333,7 +280,7 @@ class AutoPauseManager:
                         prev_state[vk] = state
                 time.sleep(0.1)
         except Exception:
-            pass  # silently skip on non-Windows
+            pass
 
 
 # ===========================================================================
@@ -499,6 +446,15 @@ class StepEditorDialog:
         action_cb.grid(row=3, column=0, sticky="w", padx=8, pady=(2, 8))
         action_cb.bind("<<ComboboxSelected>>", lambda e: self._toggle_fields())
 
+        # Press Enter: info badge
+        self.enter_info = tk.Label(
+            frame,
+            text="\u23ce  Simulates pressing the Enter key (no coordinate needed)",
+            bg=COLORS["bg"], fg=COLORS["enter_accent"],
+            font=("Segoe UI", 9, "italic"))
+        self.enter_info.grid(row=3, column=1, columnspan=2,
+                             sticky="w", padx=8, pady=(2, 8))
+
         self._lbl(frame, "Target Coordinate", 4)
         coord_row = tk.Frame(frame, bg=COLORS["bg"])
         coord_row.grid(row=5, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 0))
@@ -579,12 +535,23 @@ class StepEditorDialog:
         action = self.action_var.get()
         is_scroll = action == "Scroll"
         is_text = action in ("Input", "Typewrite")
+        is_enter = action == "Press Enter"
+
+        # Text field
         self.text_entry.config(state="normal" if is_text else "disabled")
+        # Scroll fields
         self.scroll_dir_cb.config(state="readonly" if is_scroll else "disabled")
         self.scroll_amount_spin.config(state="normal" if is_scroll else "disabled")
-        self.x_entry.config(state="normal")
-        self.y_entry.config(state="normal")
-        self.pick_btn.config(state="normal")
+        # Coordinate fields — disabled for Press Enter (no target needed)
+        coord_state = "disabled" if is_enter else "normal"
+        self.x_entry.config(state=coord_state)
+        self.y_entry.config(state=coord_state)
+        self.pick_btn.config(state=coord_state)
+        # Info badge visibility
+        if is_enter:
+            self.enter_info.grid()
+        else:
+            self.enter_info.grid_remove()
 
     def _pick_coordinate(self):
         self.win.withdraw()
@@ -629,9 +596,8 @@ class TaskCard:
         self.app_ref = app_ref
         self.index = index
         self.is_running = False
-        self._pause_mgr = None   # AutoPauseManager instance while running
+        self._pause_mgr = None
 
-        # Data migration
         if "loop_enabled" not in self.task_data:
             self.task_data["loop_enabled"] = False
         if "loop_count" not in self.task_data:
@@ -648,16 +614,12 @@ class TaskCard:
 
         self._build()
 
-    # ------------------------------------------------------------------
-    # UI build
-    # ------------------------------------------------------------------
     def _build(self):
         self.card = tk.Frame(
             self.parent_frame, bg=COLORS["card"], bd=0,
             highlightthickness=1, highlightbackground=COLORS["border"])
         self.card.pack(fill="x", padx=10, pady=6)
 
-        # ---- Header row ----
         header = tk.Frame(self.card, bg=COLORS["card"])
         header.pack(fill="x", padx=10, pady=(8, 4))
 
@@ -672,7 +634,6 @@ class TaskCard:
         btn_frame = tk.Frame(header, bg=COLORS["card"])
         btn_frame.pack(side="right")
 
-        # Run button
         self.run_btn = tk.Button(
             btn_frame, text="\u25b6  Run Task",
             bg=COLORS["green"], fg=COLORS["bg"],
@@ -680,7 +641,6 @@ class TaskCard:
             command=self._run_task)
         self.run_btn.pack(side="left", padx=4)
 
-        # Pause button
         self.pause_btn = tk.Button(
             btn_frame, text="\u23f8  Pause",
             bg=COLORS["pause_bg"], fg=COLORS["pause_fg"],
@@ -688,7 +648,6 @@ class TaskCard:
             state="disabled", command=self._toggle_pause)
         self.pause_btn.pack(side="left", padx=4)
 
-        # Stop button
         self.stop_btn = tk.Button(
             btn_frame, text="\u23f9  Stop",
             bg=COLORS["red"], fg=COLORS["bg"],
@@ -708,7 +667,6 @@ class TaskCard:
             font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2",
             command=self._delete_task).pack(side="left", padx=4)
 
-        # ---- Loop control bar ----
         loop_bar = tk.Frame(self.card, bg=COLORS["card"])
         loop_bar.pack(fill="x", padx=10, pady=(0, 4))
 
@@ -753,7 +711,6 @@ class TaskCard:
             command=self._add_section)
         self.add_section_btn.pack(side="left", padx=(16, 0))
 
-        # ---- Status label ----
         self.status_var = tk.StringVar(value="Ready")
         self.status_lbl = tk.Label(
             self.card, textvariable=self.status_var,
@@ -761,25 +718,19 @@ class TaskCard:
             font=("Segoe UI", 8), anchor="w")
         self.status_lbl.pack(fill="x", padx=10)
 
-        # ---- Sections container ----
         self.sections_frame = tk.Frame(self.card, bg=COLORS["step_bg"], pady=4)
         self.sections_frame.pack(fill="x", padx=10, pady=(4, 8))
 
         self._refresh_ui()
 
-    # ------------------------------------------------------------------
-    # Pause / Resume / Stop handlers (manual)
-    # ------------------------------------------------------------------
     def _toggle_pause(self):
         if self._pause_mgr is None:
             return
         if self._pause_mgr.is_paused and self._pause_mgr.manual_pause_active:
-            # Currently manually paused → resume
             self._pause_mgr.manual_resume()
             self.pause_btn.config(text="\u23f8  Pause", bg=COLORS["pause_bg"])
             self._update_status_color()
         else:
-            # Running (or auto-paused) → manual pause
             self._pause_mgr.manual_pause()
             self.pause_btn.config(text="\u25b6  Resume", bg=COLORS["green"])
             self._update_status_color()
@@ -796,9 +747,6 @@ class TaskCard:
         else:
             self.status_lbl.config(fg=COLORS["subtext"])
 
-    # ------------------------------------------------------------------
-    # Loop toggle helpers
-    # ------------------------------------------------------------------
     def _on_loop_toggle(self):
         self.task_data["loop_enabled"] = self.loop_enabled_var.get()
         self.app_ref.save_data()
@@ -812,9 +760,6 @@ class TaskCard:
             self.task_data["loop_count"] = 1
         self.app_ref.save_data()
 
-    # ------------------------------------------------------------------
-    # Section management
-    # ------------------------------------------------------------------
     def _add_section(self):
         name = simpledialog.askstring(
             "New Section", "Enter section name:",
@@ -850,9 +795,6 @@ class TaskCard:
             self.app_ref.save_data()
             self._refresh_ui()
 
-    # ------------------------------------------------------------------
-    # Full UI refresh
-    # ------------------------------------------------------------------
     def _refresh_ui(self):
         loop_enabled = self.loop_enabled_var.get()
         if loop_enabled:
@@ -968,6 +910,7 @@ class TaskCard:
             "Input": COLORS["accent2"],
             "Scroll": COLORS["yellow"],
             "Typewrite": COLORS["green"],
+            "Press Enter": COLORS["enter_accent"],
         }
         action = step.get("action", "Click")
         color = action_colors.get(action, COLORS["text"])
@@ -977,8 +920,11 @@ class TaskCard:
                  font=("Segoe UI", 8, "bold"), width=3).pack(side="left", padx=(0, 4))
         tk.Label(row, text=f"[{action}]",
                  bg=COLORS["section_bg"], fg=color,
-                 font=("Segoe UI", 9, "bold"), width=10, anchor="w").pack(side="left")
-        tk.Label(row, text=f"({step.get('x', 0)}, {step.get('y', 0)})",
+                 font=("Segoe UI", 9, "bold"), width=13, anchor="w").pack(side="left")
+
+        # For Press Enter, coords are irrelevant — show dash
+        coord_text = "—" if action == "Press Enter" else f"({step.get('x', 0)}, {step.get('y', 0)})"
+        tk.Label(row, text=coord_text,
                  bg=COLORS["section_bg"], fg=COLORS["subtext"],
                  font=("Consolas", 9), width=12, anchor="w").pack(side="left")
 
@@ -1006,9 +952,6 @@ class TaskCard:
                   command=lambda si=sec_idx, st=step_idx: self._move_step(si, st, -1)
                   ).pack(side="right", padx=1)
 
-    # ------------------------------------------------------------------
-    # Step CRUD
-    # ------------------------------------------------------------------
     def _add_step(self, sec_idx):
         StepEditorDialog(
             self.app_ref.root,
@@ -1043,9 +986,6 @@ class TaskCard:
             self.app_ref.save_data()
             self._refresh_ui()
 
-    # ------------------------------------------------------------------
-    # Rename / Delete task
-    # ------------------------------------------------------------------
     def _rename_task(self, event=None):
         new_name = simpledialog.askstring(
             "Rename Task", "Enter new task name:",
@@ -1068,9 +1008,6 @@ class TaskCard:
                 f"Delete task '{self.task_data.get('name')}'? This cannot be undone."):
             self.app_ref.delete_task(self.index)
 
-    # ------------------------------------------------------------------
-    # Run task
-    # ------------------------------------------------------------------
     def _run_task(self):
         if self.is_running:
             return
@@ -1082,22 +1019,19 @@ class TaskCard:
             return
         self._save_loop_settings()
 
-        # Collect all automation coords for smart mouse-ignore
         coords = []
         for sec in self.task_data.get("sections", []):
             for step in sec.get("steps", []):
-                coords.append((step.get("x", 0), step.get("y", 0)))
+                if step.get("action") != "Press Enter":
+                    coords.append((step.get("x", 0), step.get("y", 0)))
 
-        # Create pause manager
         def on_status(msg):
             self.status_var.set(msg)
-            # Sync pause button label
             if self._pause_mgr:
                 if self._pause_mgr.is_paused and self._pause_mgr.manual_pause_active:
                     self.pause_btn.config(text="\u25b6  Resume", bg=COLORS["green"])
                     self.status_lbl.config(fg=COLORS["yellow"])
                 elif self._pause_mgr.is_paused:
-                    # auto-paused
                     self.pause_btn.config(text="\u23f8  Pause", bg=COLORS["pause_bg"])
                     self.status_lbl.config(fg=COLORS["yellow"])
                 else:
@@ -1119,7 +1053,6 @@ class TaskCard:
         threading.Thread(target=self._execute_task, daemon=True).start()
 
     def _on_task_finished(self):
-        """Restore UI after task ends (call from any thread via root.after)."""
         self.is_running = False
         self._pause_mgr = None
         self.run_btn.config(text="\u25b6  Run Task",
@@ -1129,9 +1062,6 @@ class TaskCard:
         self.stop_btn.config(state="disabled")
         self.status_lbl.config(fg=COLORS["subtext"])
 
-    # ------------------------------------------------------------------
-    # Execute a single automation step
-    # ------------------------------------------------------------------
     def _execute_step(self, step):
         action = step.get("action", "Click")
         x, y = step.get("x", 0), step.get("y", 0)
@@ -1161,12 +1091,11 @@ class TaskCard:
             pyautogui.click(x, y)
             time.sleep(0.2)
             pyautogui.typewrite(text, interval=0.08)
+        elif action == "Press Enter":
+            pyautogui.press("enter")
 
         time.sleep(delay)
 
-    # ------------------------------------------------------------------
-    # Main execution engine  (pause-aware)
-    # ------------------------------------------------------------------
     def _execute_task(self):
         pm = self._pause_mgr
         loop_enabled = self.task_data.get("loop_enabled", False)
@@ -1174,11 +1103,9 @@ class TaskCard:
         sections = self.task_data.get("sections", [])
 
         def run_section_once(sec, iteration_label=""):
-            """Run all steps in a section; return False if stopped."""
             for step_idx, step in enumerate(sec.get("steps", [])):
-                # ---- PAUSE POINT ----
                 if not pm.wait_if_paused():
-                    return False   # stopped
+                    return False
                 label = (
                     f"{iteration_label}"
                     f"[{sec['name']}] Step {step_idx + 1}: {step.get('action')}"
@@ -1208,7 +1135,6 @@ class TaskCard:
                         steps = sec.get("steps", [])
                         if not steps:
                             continue
-
                         if sec_loop == 0:
                             if not run_section_once(sec, iter_lbl):
                                 raise StopIteration
@@ -1244,7 +1170,7 @@ class AutoFlowApp:
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("AutoFlow \u2014 PyAutoGUI Task Automation Builder")
+        self.root.title("AutoFlow v1.0 \u2014 PyAutoGUI Task Automation Builder")
         self.root.geometry("980x720")
         self.root.configure(bg=COLORS["bg"])
         self.root.minsize(700, 500)
@@ -1267,7 +1193,7 @@ class AutoFlowApp:
             font=("Segoe UI", 16, "bold")
         ).pack(side="left", padx=16, pady=10)
         tk.Label(
-            topbar, text="PyAutoGUI Task Automation Builder",
+            topbar, text="v1.0  \u2014  PyAutoGUI Task Automation Builder",
             bg=COLORS["sidebar"], fg=COLORS["subtext"],
             font=("Segoe UI", 9)
         ).pack(side="left", padx=4, pady=10)
@@ -1301,8 +1227,8 @@ class AutoFlowApp:
         footer.pack_propagate(False)
         tk.Label(
             footer,
-            text=("Tip: Auto-pause activates when user mouse/keyboard activity is "
-                  "detected during automation. Use \u23f8 Pause / \u23f9 Stop for manual control."),
+            text=("Tip: Auto-pause activates on mouse/keyboard activity during automation. "
+                  "Use \u23f8 Pause / \u23f9 Stop for manual control."),
             bg=COLORS["sidebar"], fg=COLORS["subtext"],
             font=("Segoe UI", 8)
         ).pack(side="left", padx=12)
