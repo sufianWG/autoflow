@@ -33,52 +33,101 @@ pyautogui.PAUSE = 0.3
 
 
 class CoordinateSelector:
-    """Full-screen overlay for selecting a coordinate point by clicking."""
+    """Full-screen screenshot overlay for selecting a coordinate by dragging a rectangle."""
 
     def __init__(self, parent, callback):
         self.parent = parent
         self.callback = callback
-        self.overlay = None
         self._build()
 
     def _build(self):
-        self.overlay = tk.Toplevel(self.parent)
-        self.overlay.attributes("-fullscreen", True)
-        self.overlay.attributes("-topmost", True)
-        self.overlay.attributes("-alpha", 0.35)
-        self.overlay.configure(bg="#000000")
-        self.overlay.config(cursor="crosshair")
+        # Step 1: grab screenshot BEFORE creating the overlay window
+        try:
+            screenshot = ImageGrab.grab()
+        except Exception as e:
+            messagebox.showerror("Screenshot Error", f"Failed to capture screen: {e}", parent=self.parent)
+            self.callback(None, None)
+            return
 
-        canvas = tk.Canvas(
-            self.overlay,
-            bg="#000000",
-            highlightthickness=0,
+        sel_win = tk.Toplevel(self.parent)
+        sel_win.title("Select Coordinate")
+        sel_win.attributes("-fullscreen", True)
+        sel_win.attributes("-topmost", True)
+        sel_win.overrideredirect(True)  # remove title bar
+
+        canvas = tk.Canvas(sel_win, cursor="crosshair", highlightthickness=0)
+        canvas.pack(fill=tk.BOTH, expand=True)
+
+        # Display screenshot on canvas
+        tk_image = ImageTk.PhotoImage(screenshot)
+        canvas.create_image(0, 0, anchor=tk.NW, image=tk_image)
+        canvas.image = tk_image  # keep reference
+
+        screen_w = screenshot.width
+        screen_h = screenshot.height
+
+        # Instruction overlay
+        canvas.create_rectangle(
+            10, 10, screen_w - 10, 60,
+            fill="black", outline="white", width=2,
         )
-        canvas.pack(fill="both", expand=True)
-
-        screen_w = self.overlay.winfo_screenwidth()
-        screen_h = self.overlay.winfo_screenheight()
-
         canvas.create_text(
-            screen_w // 2,
-            screen_h // 2,
-            text="Click on the target position  |  Press ESC to cancel",
-            fill="#ffffff",
-            font=("Arial", 20, "bold"),
+            screen_w // 2, 35,
+            text="Click and drag to select target area  |  Press ESC to cancel",
+            fill="white",
+            font=("Arial", 16, "bold"),
         )
 
-        canvas.bind("<Button-1>", self._on_click)
-        self.overlay.bind("<Escape>", self._on_cancel)
-        canvas.focus_set()
+        rect_state = {"x1": 0, "y1": 0, "x2": 0, "y2": 0, "rect_id": None}
 
-    def _on_click(self, event):
-        x, y = event.x_root, event.y_root
-        self.overlay.destroy()
-        self.callback(x, y)
+        def on_m_down(e):
+            rect_state["x1"] = canvas.canvasx(e.x)
+            rect_state["y1"] = canvas.canvasy(e.y)
+            if rect_state["rect_id"]:
+                canvas.delete(rect_state["rect_id"])
+            rect_state["rect_id"] = canvas.create_rectangle(
+                rect_state["x1"], rect_state["y1"],
+                rect_state["x1"], rect_state["y1"],
+                outline="red", width=3,
+            )
 
-    def _on_cancel(self, event):
-        self.overlay.destroy()
-        self.callback(None, None)
+        def on_m_move(e):
+            if rect_state["rect_id"]:
+                rect_state["x2"] = canvas.canvasx(e.x)
+                rect_state["y2"] = canvas.canvasy(e.y)
+                canvas.coords(
+                    rect_state["rect_id"],
+                    rect_state["x1"], rect_state["y1"],
+                    rect_state["x2"], rect_state["y2"],
+                )
+
+        def on_m_up(e):
+            rect_state["x2"] = canvas.canvasx(e.x)
+            rect_state["y2"] = canvas.canvasy(e.y)
+            x1 = min(rect_state["x1"], rect_state["x2"])
+            x2 = max(rect_state["x1"], rect_state["x2"])
+            y1 = min(rect_state["y1"], rect_state["y2"])
+            y2 = max(rect_state["y1"], rect_state["y2"])
+            cx = int((x1 + x2) / 2)
+            cy = int((y1 + y2) / 2)
+            sel_win.grab_release()
+            sel_win.destroy()
+            self.callback(cx, cy)
+
+        def on_escape(e):
+            sel_win.grab_release()
+            sel_win.destroy()
+            self.callback(None, None)
+
+        canvas.bind("<ButtonPress-1>", on_m_down)
+        canvas.bind("<B1-Motion>", on_m_move)
+        canvas.bind("<ButtonRelease-1>", on_m_up)
+        sel_win.bind("<Escape>", on_escape)
+
+        # Correct order: update → focus_force → grab_set (always last)
+        sel_win.update()
+        sel_win.focus_force()
+        sel_win.grab_set()
 
 
 class StepEditorDialog:
@@ -304,16 +353,12 @@ class StepEditorDialog:
         self.pick_btn.config(state=state_coord)
 
     def _pick_coordinate(self):
-        # Toplevel window cannot be iconified when set as transient.
-        # Instead, withdraw both the dialog and its parent, then
-        # restore them after coordinate selection — same pattern as sufianWG/uniapp.
         self.win.withdraw()
         self.parent.iconify()
         self.win.after(200, self._initiate_coordinate_pick)
 
     def _initiate_coordinate_pick(self):
         def on_coord(x, y):
-            # Restore parent root first, then the dialog
             self.parent.deiconify()
             self.win.deiconify()
             self.win.lift()
