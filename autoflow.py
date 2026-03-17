@@ -66,17 +66,45 @@ class CoordinateSelector:
         screen_w = screenshot.width
         screen_h = screenshot.height
 
-        # Instruction overlay
-        canvas.create_rectangle(
-            10, 10, screen_w - 10, 60,
-            fill="black", outline="white", width=2,
-        )
-        canvas.create_text(
-            screen_w // 2, 35,
-            text="Click and drag to select target area  |  Press ESC to cancel",
-            fill="white",
-            font=("Arial", 16, "bold"),
-        )
+        # --- Dynamic instruction overlay ---
+        instruction_state = {"bg_id": None, "text_id": None}
+
+        INSTRUCTION_TEXT = "Click and drag to select target area  |  Press ESC to cancel"
+        BAR_HEIGHT = 50
+        MARGIN = 10
+
+        def draw_instruction(mouse_y):
+            """Redraw the instruction bar at top or bottom depending on mouse Y."""
+            # Remove previous elements
+            if instruction_state["bg_id"] is not None:
+                canvas.delete(instruction_state["bg_id"])
+            if instruction_state["text_id"] is not None:
+                canvas.delete(instruction_state["text_id"])
+
+            # If mouse is in the top third of the screen → show bar at bottom
+            if mouse_y < screen_h / 3:
+                y1 = screen_h - BAR_HEIGHT - MARGIN
+                y2 = screen_h - MARGIN
+            else:
+                # Otherwise show bar at top
+                y1 = MARGIN
+                y2 = MARGIN + BAR_HEIGHT
+
+            bg_id = canvas.create_rectangle(
+                MARGIN, y1, screen_w - MARGIN, y2,
+                fill="black", outline="white", width=2,
+            )
+            text_id = canvas.create_text(
+                screen_w // 2, (y1 + y2) // 2,
+                text=INSTRUCTION_TEXT,
+                fill="white",
+                font=("Arial", 16, "bold"),
+            )
+            instruction_state["bg_id"] = bg_id
+            instruction_state["text_id"] = text_id
+
+        # Initial draw (assume mouse is roughly in the middle)
+        draw_instruction(screen_h // 2)
 
         rect_state = {"x1": 0, "y1": 0, "x2": 0, "y2": 0, "rect_id": None}
 
@@ -90,8 +118,10 @@ class CoordinateSelector:
                 rect_state["x1"], rect_state["y1"],
                 outline="red", width=3,
             )
+            draw_instruction(e.y)
 
         def on_m_move(e):
+            draw_instruction(e.y)
             if rect_state["rect_id"]:
                 rect_state["x2"] = canvas.canvasx(e.x)
                 rect_state["y2"] = canvas.canvasy(e.y)
@@ -122,6 +152,7 @@ class CoordinateSelector:
         canvas.bind("<ButtonPress-1>", on_m_down)
         canvas.bind("<B1-Motion>", on_m_move)
         canvas.bind("<ButtonRelease-1>", on_m_up)
+        canvas.bind("<Motion>", on_m_move)   # track mouse even without button held
         sel_win.bind("<Escape>", on_escape)
 
         # Correct order: update → focus_force → grab_set (always last)
