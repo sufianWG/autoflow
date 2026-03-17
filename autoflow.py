@@ -29,15 +29,316 @@ COLORS = {
     "section_bg": "#1a1a2e",
     "section_header": "#2a2a3e",
     "loop_accent": "#fab387",
+    "pause_bg": "#45475a",
+    "pause_fg": "#f9e2af",
 }
 
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.3
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# AutoPauseManager  —  Ported & adapted from uniapp/pause_manager.py
+#                      + uniapp/improved_mouse_monitor.py
+# ===========================================================================
+class AutoPauseManager:
+    """
+    Manages auto-pause (mouse/keyboard activity detection) and manual
+    pause/resume/stop for a running automation task.
+
+    State machine:
+        IDLE  →  RUNNING  →  PAUSED  →  RUNNING
+                          →  STOPPED
+    """
+
+    # Mouse-movement threshold (pixels) to trigger auto-pause
+    MOUSE_MOVE_THRESHOLD = 80
+    # How long (sec) to watch for continued user activity before retrigger
+    MOUSE_CHECK_INTERVAL = 0.4
+    # After auto-pause: how many seconds of inactivity before auto-resume
+    AUTO_RESUME_IDLE_SECS = 2.5
+    # Radius (px) around an automation click coord – ignored as user movement
+    AUTOMATION_AREA_RADIUS = 60
+    # Max movement history samples for direction-change analysis
+    MAX_HISTORY = 6
+
+    def __init__(self, on_status_update, root_widget):
+        """
+        Args:
+            on_status_update : callable(str)  – updates status label
+            root_widget      : tk root/widget – for thread-safe .after() calls
+        """
+        self.on_status_update = on_status_update
+        self.root = root_widget
+
+        # Threading events
+        self.pause_event = threading.Event()    # set  → paused
+        self.resume_event = threading.Event()   # set  → may continue
+        self.stop_event = threading.Event()     # set  → abort
+        self.resume_event.set()                 # default: not paused
+
+        # State flags (mirrors uniapp PauseManager)
+        self.manual_pause_active = False
+        self.auto_pause_active = False
+        self.force_pause_mode = False
+        self.pause_timestamp = None
+
+        # Mouse monitor state
+        self.last_mouse_pos = None
+        self.automation_running = False
+        self._monitor_thread = None
+        self._known_automation_coords = []   # list of (x,y) tuples from current task
+
+        # Keyboard monitor state
+        self._kb_monitor_thread = None
+        self._last_kb_time = 0
+
+    # ------------------------------------------------------------------
+    # Public control API
+    # ------------------------------------------------------------------
+    def start(self, automation_coords=None):
+        """Call when automation begins."""
+        self.stop_event.clear()
+        self.pause_event.clear()
+        self.resume_event.set()
+        self.manual_pause_active = False
+        self.auto_pause_active = False
+        self.automation_running = True
+        self._known_automation_coords = automation_coords or []
+        self._start_mouse_monitor()
+        self._start_keyboard_monitor()
+
+    def stop(self):
+        """Call to permanently stop automation."""
+        self.stop_event.set()
+        self.pause_event.clear()
+        self.resume_event.set()   # unblock any waiting threads
+        self.automation_running = False
+        self.manual_pause_active = False
+        self.auto_pause_active = False
+
+    def manual_pause(self):
+        """User explicitly paused – strongest lock, auto-resume won't clear it."""
+        if self.stop_event.is_set():
+            return
+        self.manual_pause_active = True
+        self.auto_pause_active = False
+        self.force_pause_mode = True
+        self.pause_timestamp = time.time()
+        self.resume_event.clear()
+        self.pause_event.set()
+        self.on_status_update("⏸ Paused manually")
+
+    def manual_resume(self):
+        """User explicitly resumed."""
+        if self.stop_event.is_set():
+            return
+        self.manual_pause_active = False
+        self.auto_pause_active = False
+        self.force_pause_mode = False
+        self.pause_event.clear()
+        self.resume_event.set()
+        self.on_status_update("▶ Resumed")
+
+    def auto_pause(self, reason="User activity detected"):
+        """Called internally when mouse/keyboard activity is sensed."""
+        if self.stop_event.is_set() or self.manual_pause_active:
+            return
+        if self.auto_pause_active:
+            return  # already auto-paused
+        self.auto_pause_active = True
+        self.pause_timestamp = time.time()
+        self.resume_event.clear()
+        self.pause_event.set()
+        self.on_status_update(f"⚡ Auto-paused: {reason}")
+        # Schedule auto-resume watcher
+        t = threading.Thread(target=self._auto_resume_watcher, daemon=True)
+        t.start()
+
+    def _auto_resume_watcher(self):
+        """
+        After an auto-pause, watch mouse position for inactivity.
+        If mouse is idle for AUTO_RESUME_IDLE_SECS, resume automatically.
+        But if user has manually paused in the meantime, do not resume.
+        """
+        last_pos = pyautogui.position()
+        while not self.stop_event.is_set():
+            time.sleep(0.3)
+            if self.stop_event.is_set():
+                break
+            if self.manual_pause_active:
+                # Manual pause took over – watcher exits without resuming
+                break
+            if not self.auto_pause_active:
+                break
+            current_pos = pyautogui.position()
+            dx = current_pos.x - last_pos.x
+            dy = current_pos.y - last_pos.y
+            if (dx**2 + dy**2)**0.5 < 5:   # mouse is still
+                elapsed = time.time() - (self.pause_timestamp or time.time())
+                if elapsed >= self.AUTO_RESUME_IDLE_SECS:
+                    # Safe to auto-resume
+                    self.auto_pause_active = False
+                    self.pause_event.clear()
+                    self.resume_event.set()
+                    self.on_status_update("▶ Auto-resumed (user idle)")
+                    break
+            else:
+                # User still moving – reset timer
+                self.pause_timestamp = time.time()
+                last_pos = current_pos
+
+    # ------------------------------------------------------------------
+    # Wait helper (used by execution engine between steps)
+    # ------------------------------------------------------------------
+    def wait_if_paused(self):
+        """
+        Block the caller (automation thread) while paused.
+        Returns False if stop was requested, True otherwise.
+        """
+        while self.pause_event.is_set() and not self.stop_event.is_set():
+            time.sleep(0.1)
+        return not self.stop_event.is_set()
+
+    @property
+    def is_paused(self):
+        return self.pause_event.is_set()
+
+    @property
+    def is_stopped(self):
+        return self.stop_event.is_set()
+
+    # ------------------------------------------------------------------
+    # Mouse monitor  (adapted from uniapp/improved_mouse_monitor.py)
+    # ------------------------------------------------------------------
+    def _start_mouse_monitor(self):
+        self._monitor_thread = threading.Thread(
+            target=self._mouse_monitor_loop, daemon=True)
+        self._monitor_thread.start()
+
+    def _mouse_monitor_loop(self):
+        movement_history = []
+        self.last_mouse_pos = pyautogui.position()
+
+        while not self.stop_event.is_set():
+            try:
+                current_pos = pyautogui.position()
+                current_time = time.time()
+
+                if (self.automation_running
+                        and not self.pause_event.is_set()
+                        and not self.manual_pause_active
+                        and self.last_mouse_pos is not None):
+
+                    dx = current_pos.x - self.last_mouse_pos.x
+                    dy = current_pos.y - self.last_mouse_pos.y
+                    distance = (dx**2 + dy**2)**0.5
+
+                    # Maintain movement history
+                    if len(movement_history) >= self.MAX_HISTORY:
+                        movement_history.pop(0)
+                    movement_history.append((current_time, distance, dx, dy))
+
+                    is_user_movement = False
+
+                    if distance > self.MOUSE_MOVE_THRESHOLD:
+                        # Check if near any known automation coordinate
+                        near_auto = False
+                        for ax, ay in self._known_automation_coords:
+                            d = ((current_pos.x - ax)**2 + (current_pos.y - ay)**2)**0.5
+                            if d < self.AUTOMATION_AREA_RADIUS:
+                                near_auto = True
+                                break
+
+                        if not near_auto:
+                            is_user_movement = True
+
+                        # Direction-change pattern = human movement
+                        if len(movement_history) >= 3:
+                            direction_changes = 0
+                            prev_dx, prev_dy = 0, 0
+                            for _, _, cdx, cdy in movement_history[1:]:
+                                if (prev_dx * cdx < 0) or (prev_dy * cdy < 0):
+                                    direction_changes += 1
+                                prev_dx, prev_dy = cdx, cdy
+                            if direction_changes >= 2:
+                                is_user_movement = True
+
+                    if is_user_movement:
+                        self.root.after(0, lambda: self.auto_pause("Mouse movement"))
+                        self.last_mouse_pos = current_pos
+                        time.sleep(1.5)   # debounce
+                        continue
+
+                self.last_mouse_pos = current_pos
+
+            except Exception:
+                pass
+
+            # Interruptible sleep
+            for _ in range(int(self.MOUSE_CHECK_INTERVAL / 0.05)):
+                if self.stop_event.is_set():
+                    break
+                time.sleep(0.05)
+
+    # ------------------------------------------------------------------
+    # Keyboard monitor
+    # ------------------------------------------------------------------
+    def _start_keyboard_monitor(self):
+        self._kb_monitor_thread = threading.Thread(
+            target=self._keyboard_monitor_loop, daemon=True)
+        self._kb_monitor_thread.start()
+
+    def _keyboard_monitor_loop(self):
+        """
+        Monitors keyboard activity via pynput if available, otherwise
+        falls back to a lightweight polling approach using ctypes on Windows.
+        """
+        try:
+            from pynput import keyboard as pynput_kb
+
+            def on_press(key):
+                if self.stop_event.is_set():
+                    return False  # stop listener
+                if (self.automation_running
+                        and not self.pause_event.is_set()
+                        and not self.manual_pause_active):
+                    self.root.after(0, lambda: self.auto_pause("Keyboard activity"))
+
+            with pynput_kb.Listener(on_press=on_press) as listener:
+                while not self.stop_event.is_set():
+                    time.sleep(0.2)
+                listener.stop()
+
+        except ImportError:
+            # pynput not installed – use ctypes polling (Windows only)
+            self._keyboard_monitor_ctypes()
+
+    def _keyboard_monitor_ctypes(self):
+        """Fallback keyboard monitor using ctypes GetAsyncKeyState (Windows)."""
+        try:
+            import ctypes
+            MONITORED_KEYS = list(range(0x08, 0x90))  # most common VK codes
+            prev_state = {k: False for k in MONITORED_KEYS}
+
+            while not self.stop_event.is_set():
+                if (self.automation_running
+                        and not self.pause_event.is_set()
+                        and not self.manual_pause_active):
+                    for vk in MONITORED_KEYS:
+                        state = bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+                        if state and not prev_state[vk]:
+                            self.root.after(0, lambda: self.auto_pause("Keyboard activity"))
+                            break
+                        prev_state[vk] = state
+                time.sleep(0.1)
+        except Exception:
+            pass  # silently skip on non-Windows
+
+
+# ===========================================================================
 # CoordinateSelector
-# ---------------------------------------------------------------------------
+# ===========================================================================
 class CoordinateSelector:
     """Full-screen screenshot overlay for selecting a coordinate by dragging."""
 
@@ -50,7 +351,8 @@ class CoordinateSelector:
         try:
             screenshot = ImageGrab.grab()
         except Exception as e:
-            messagebox.showerror("Screenshot Error", f"Failed to capture screen: {e}", parent=self.parent)
+            messagebox.showerror("Screenshot Error", f"Failed to capture screen: {e}",
+                                 parent=self.parent)
             self.callback(None, None)
             return
 
@@ -87,7 +389,8 @@ class CoordinateSelector:
                 y1 = MARGIN
                 y2 = MARGIN + BAR_HEIGHT
             instruction_state["bg_id"] = canvas.create_rectangle(
-                MARGIN, y1, screen_w - MARGIN, y2, fill="black", outline="white", width=2)
+                MARGIN, y1, screen_w - MARGIN, y2,
+                fill="black", outline="white", width=2)
             instruction_state["text_id"] = canvas.create_text(
                 screen_w // 2, (y1 + y2) // 2, text=INSTRUCTION_TEXT,
                 fill="white", font=("Arial", 16, "bold"))
@@ -103,7 +406,8 @@ class CoordinateSelector:
                 canvas.delete(rect_state["rect_id"])
             rect_state["rect_id"] = canvas.create_rectangle(
                 rect_state["x1"], rect_state["y1"],
-                rect_state["x1"], rect_state["y1"], outline="red", width=3)
+                rect_state["x1"], rect_state["y1"],
+                outline="red", width=3)
             draw_instruction(e.y)
 
         def on_m_move(e):
@@ -144,9 +448,9 @@ class CoordinateSelector:
         sel_win.grab_set()
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # StepEditorDialog
-# ---------------------------------------------------------------------------
+# ===========================================================================
 class StepEditorDialog:
     """Dialog window to create or edit a single step."""
 
@@ -174,7 +478,8 @@ class StepEditorDialog:
     def _lbl(self, parent, text, row, col=0, colspan=1):
         tk.Label(parent, text=text, bg=COLORS["bg"], fg=COLORS["subtext"],
                  font=("Segoe UI", 9)).grid(
-            row=row, column=col, columnspan=colspan, sticky="w", padx=8, pady=(6, 0))
+            row=row, column=col, columnspan=colspan,
+            sticky="w", padx=8, pady=(6, 0))
 
     def _build(self):
         frame = tk.Frame(self.win, bg=COLORS["bg"], padx=16, pady=16)
@@ -182,14 +487,15 @@ class StepEditorDialog:
 
         self._lbl(frame, "Step Description (optional)", 0)
         self.desc_var = tk.StringVar(value=self.step_data.get("description", ""))
-        tk.Entry(frame, textvariable=self.desc_var, bg=COLORS["card"], fg=COLORS["text"],
-                 insertbackground=COLORS["text"], font=("Segoe UI", 10), width=38,
-                 relief="flat").grid(row=1, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 8))
+        tk.Entry(frame, textvariable=self.desc_var, bg=COLORS["card"],
+                 fg=COLORS["text"], insertbackground=COLORS["text"],
+                 font=("Segoe UI", 10), width=38, relief="flat"
+                 ).grid(row=1, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 8))
 
         self._lbl(frame, "Action Type", 2)
         self.action_var = tk.StringVar(value=self.step_data.get("action", "Click"))
-        action_cb = ttk.Combobox(frame, textvariable=self.action_var, values=ACTION_TYPES,
-                                 state="readonly", width=16)
+        action_cb = ttk.Combobox(frame, textvariable=self.action_var,
+                                 values=ACTION_TYPES, state="readonly", width=16)
         action_cb.grid(row=3, column=0, sticky="w", padx=8, pady=(2, 8))
         action_cb.bind("<<ComboboxSelected>>", lambda e: self._toggle_fields())
 
@@ -213,41 +519,50 @@ class StepEditorDialog:
                                 font=("Segoe UI", 10), width=6, relief="flat")
         self.y_entry.pack(side="left", padx=(2, 8))
 
-        self.pick_btn = tk.Button(coord_row, text="\U0001f4cd Pick from Screen",
-                                  bg=COLORS["accent2"], fg=COLORS["bg"],
-                                  font=("Segoe UI", 9, "bold"), relief="flat",
-                                  cursor="hand2", command=self._pick_coordinate)
+        self.pick_btn = tk.Button(
+            coord_row, text="\U0001f4cd Pick from Screen",
+            bg=COLORS["accent2"], fg=COLORS["bg"],
+            font=("Segoe UI", 9, "bold"), relief="flat",
+            cursor="hand2", command=self._pick_coordinate)
         self.pick_btn.pack(side="left", padx=(0, 4))
 
         self._lbl(frame, "Text to Type (for Input / Typewrite)", 6)
         self.text_var = tk.StringVar(value=self.step_data.get("text", ""))
-        self.text_entry = tk.Entry(frame, textvariable=self.text_var, bg=COLORS["card"],
-                                   fg=COLORS["text"], insertbackground=COLORS["text"],
-                                   font=("Segoe UI", 10), width=38, relief="flat")
-        self.text_entry.grid(row=7, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 8))
+        self.text_entry = tk.Entry(
+            frame, textvariable=self.text_var, bg=COLORS["card"],
+            fg=COLORS["text"], insertbackground=COLORS["text"],
+            font=("Segoe UI", 10), width=38, relief="flat")
+        self.text_entry.grid(row=7, column=0, columnspan=3,
+                             sticky="ew", padx=8, pady=(2, 8))
 
         self._lbl(frame, "Scroll Direction", 8)
-        self.scroll_dir_var = tk.StringVar(value=self.step_data.get("scroll_direction", "down"))
-        self.scroll_dir_cb = ttk.Combobox(frame, textvariable=self.scroll_dir_var,
-                                          values=["down", "up", "left", "right"],
-                                          state="readonly", width=10)
+        self.scroll_dir_var = tk.StringVar(
+            value=self.step_data.get("scroll_direction", "down"))
+        self.scroll_dir_cb = ttk.Combobox(
+            frame, textvariable=self.scroll_dir_var,
+            values=["down", "up", "left", "right"],
+            state="readonly", width=10)
         self.scroll_dir_cb.grid(row=9, column=0, sticky="w", padx=8, pady=(2, 4))
 
         self._lbl(frame, "Scroll Amount (clicks)", 8, col=1)
-        self.scroll_amount_var = tk.IntVar(value=self.step_data.get("scroll_amount", 3))
-        self.scroll_amount_spin = tk.Spinbox(frame, from_=1, to=50,
-                                             textvariable=self.scroll_amount_var,
-                                             bg=COLORS["card"], fg=COLORS["text"],
-                                             buttonbackground=COLORS["border"],
-                                             font=("Segoe UI", 10), width=6, relief="flat")
+        self.scroll_amount_var = tk.IntVar(
+            value=self.step_data.get("scroll_amount", 3))
+        self.scroll_amount_spin = tk.Spinbox(
+            frame, from_=1, to=50, textvariable=self.scroll_amount_var,
+            bg=COLORS["card"], fg=COLORS["text"],
+            buttonbackground=COLORS["border"],
+            font=("Segoe UI", 10), width=6, relief="flat")
         self.scroll_amount_spin.grid(row=9, column=1, sticky="w", padx=8, pady=(2, 4))
 
         self._lbl(frame, "Delay after action (seconds)", 10)
         self.delay_var = tk.DoubleVar(value=self.step_data.get("delay", 0.5))
-        tk.Spinbox(frame, from_=0, to=30, increment=0.1, format="%.1f",
-                   textvariable=self.delay_var, bg=COLORS["card"], fg=COLORS["text"],
-                   buttonbackground=COLORS["border"], font=("Segoe UI", 10), width=8,
-                   relief="flat").grid(row=11, column=0, sticky="w", padx=8, pady=(2, 12))
+        tk.Spinbox(
+            frame, from_=0, to=30, increment=0.1, format="%.1f",
+            textvariable=self.delay_var,
+            bg=COLORS["card"], fg=COLORS["text"],
+            buttonbackground=COLORS["border"],
+            font=("Segoe UI", 10), width=8, relief="flat"
+        ).grid(row=11, column=0, sticky="w", padx=8, pady=(2, 12))
 
         btn_row = tk.Frame(frame, bg=COLORS["bg"])
         btn_row.grid(row=12, column=0, columnspan=3, pady=(8, 0))
@@ -302,9 +617,9 @@ class StepEditorDialog:
         self.win.destroy()
 
 
-# ---------------------------------------------------------------------------
-# TaskCard  (with Loop + Section support)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# TaskCard  (Loop + Section + Pause/Resume/Stop controls)
+# ===========================================================================
 class TaskCard:
     """Widget representing a single task with optional loop sections."""
 
@@ -314,16 +629,17 @@ class TaskCard:
         self.app_ref = app_ref
         self.index = index
         self.is_running = False
+        self._pause_mgr = None   # AutoPauseManager instance while running
 
-        # Ensure data structure is initialised
+        # Data migration
         if "loop_enabled" not in self.task_data:
             self.task_data["loop_enabled"] = False
         if "loop_count" not in self.task_data:
             self.task_data["loop_count"] = 1
-        # Legacy: if task has flat 'steps', migrate to sections
         if "steps" in self.task_data and "sections" not in self.task_data:
             self.task_data["sections"] = [
-                {"name": "Section 1", "loop_count": 0, "steps": self.task_data.pop("steps")}
+                {"name": "Section 1", "loop_count": 0,
+                 "steps": self.task_data.pop("steps")}
             ]
         if "sections" not in self.task_data:
             self.task_data["sections"] = [
@@ -336,82 +652,114 @@ class TaskCard:
     # UI build
     # ------------------------------------------------------------------
     def _build(self):
-        self.card = tk.Frame(self.parent_frame, bg=COLORS["card"], bd=0,
-                             highlightthickness=1, highlightbackground=COLORS["border"])
+        self.card = tk.Frame(
+            self.parent_frame, bg=COLORS["card"], bd=0,
+            highlightthickness=1, highlightbackground=COLORS["border"])
         self.card.pack(fill="x", padx=10, pady=6)
 
         # ---- Header row ----
         header = tk.Frame(self.card, bg=COLORS["card"])
         header.pack(fill="x", padx=10, pady=(8, 4))
 
-        self.name_var = tk.StringVar(value=self.task_data.get("name", "Unnamed Task"))
-        name_lbl = tk.Label(header, textvariable=self.name_var, bg=COLORS["card"],
-                            fg=COLORS["accent"], font=("Segoe UI", 12, "bold"), anchor="w")
+        self.name_var = tk.StringVar(
+            value=self.task_data.get("name", "Unnamed Task"))
+        name_lbl = tk.Label(
+            header, textvariable=self.name_var, bg=COLORS["card"],
+            fg=COLORS["accent"], font=("Segoe UI", 12, "bold"), anchor="w")
         name_lbl.pack(side="left")
         name_lbl.bind("<Double-Button-1>", self._rename_task)
 
         btn_frame = tk.Frame(header, bg=COLORS["card"])
         btn_frame.pack(side="right")
 
-        self.run_btn = tk.Button(btn_frame, text="\u25b6  Run Task", bg=COLORS["green"],
-                                 fg=COLORS["bg"], font=("Segoe UI", 9, "bold"),
-                                 relief="flat", cursor="hand2", command=self._run_task)
+        # Run button
+        self.run_btn = tk.Button(
+            btn_frame, text="\u25b6  Run Task",
+            bg=COLORS["green"], fg=COLORS["bg"],
+            font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2",
+            command=self._run_task)
         self.run_btn.pack(side="left", padx=4)
 
-        tk.Button(btn_frame, text="\u270e Rename", bg=COLORS["border"], fg=COLORS["text"],
-                  font=("Segoe UI", 9), relief="flat", cursor="hand2",
-                  command=self._rename_task).pack(side="left", padx=4)
+        # Pause button
+        self.pause_btn = tk.Button(
+            btn_frame, text="\u23f8  Pause",
+            bg=COLORS["pause_bg"], fg=COLORS["pause_fg"],
+            font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2",
+            state="disabled", command=self._toggle_pause)
+        self.pause_btn.pack(side="left", padx=4)
 
-        tk.Button(btn_frame, text="\U0001f5d1 Delete Task", bg=COLORS["red"], fg=COLORS["bg"],
-                  font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2",
-                  command=self._delete_task).pack(side="left", padx=4)
+        # Stop button
+        self.stop_btn = tk.Button(
+            btn_frame, text="\u23f9  Stop",
+            bg=COLORS["red"], fg=COLORS["bg"],
+            font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2",
+            state="disabled", command=self._stop_task)
+        self.stop_btn.pack(side="left", padx=4)
+
+        tk.Button(
+            btn_frame, text="\u270e Rename",
+            bg=COLORS["border"], fg=COLORS["text"],
+            font=("Segoe UI", 9), relief="flat", cursor="hand2",
+            command=self._rename_task).pack(side="left", padx=4)
+
+        tk.Button(
+            btn_frame, text="\U0001f5d1 Delete",
+            bg=COLORS["red"], fg=COLORS["bg"],
+            font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2",
+            command=self._delete_task).pack(side="left", padx=4)
 
         # ---- Loop control bar ----
         loop_bar = tk.Frame(self.card, bg=COLORS["card"])
         loop_bar.pack(fill="x", padx=10, pady=(0, 4))
 
-        self.loop_enabled_var = tk.BooleanVar(value=self.task_data.get("loop_enabled", False))
-        loop_chk = tk.Checkbutton(
+        self.loop_enabled_var = tk.BooleanVar(
+            value=self.task_data.get("loop_enabled", False))
+        tk.Checkbutton(
             loop_bar, text="\U0001f501  Enable Loop",
             variable=self.loop_enabled_var,
             bg=COLORS["card"], fg=COLORS["loop_accent"],
-            selectcolor=COLORS["bg"], activebackground=COLORS["card"],
+            selectcolor=COLORS["bg"],
+            activebackground=COLORS["card"],
             activeforeground=COLORS["loop_accent"],
             font=("Segoe UI", 9, "bold"),
             command=self._on_loop_toggle,
-        )
-        loop_chk.pack(side="left")
+        ).pack(side="left")
 
-        tk.Label(loop_bar, text="   Loop Count:", bg=COLORS["card"],
-                 fg=COLORS["subtext"], font=("Segoe UI", 9)).pack(side="left")
+        tk.Label(loop_bar, text="   Loop Count:",
+                 bg=COLORS["card"], fg=COLORS["subtext"],
+                 font=("Segoe UI", 9)).pack(side="left")
 
-        self.loop_count_var = tk.IntVar(value=max(1, self.task_data.get("loop_count", 1)))
+        self.loop_count_var = tk.IntVar(
+            value=max(1, self.task_data.get("loop_count", 1)))
         self.loop_count_spin = tk.Spinbox(
-            loop_bar, from_=1, to=9999, textvariable=self.loop_count_var,
+            loop_bar, from_=1, to=9999,
+            textvariable=self.loop_count_var,
             bg=COLORS["card"], fg=COLORS["loop_accent"],
             buttonbackground=COLORS["border"],
             font=("Segoe UI", 9, "bold"), width=6, relief="flat",
-            command=self._save_loop_settings,
-        )
+            command=self._save_loop_settings)
         self.loop_count_spin.pack(side="left", padx=(4, 12))
-        self.loop_count_spin.bind("<FocusOut>", lambda e: self._save_loop_settings())
+        self.loop_count_spin.bind("<FocusOut>",
+                                  lambda e: self._save_loop_settings())
 
-        tk.Label(loop_bar, text="times", bg=COLORS["card"],
-                 fg=COLORS["subtext"], font=("Segoe UI", 9)).pack(side="left")
+        tk.Label(loop_bar, text="times",
+                 bg=COLORS["card"], fg=COLORS["subtext"],
+                 font=("Segoe UI", 9)).pack(side="left")
 
-        # Add Section button (visible only when loop enabled)
         self.add_section_btn = tk.Button(
-            loop_bar, text="+ Add Section", bg=COLORS["loop_accent"], fg=COLORS["bg"],
+            loop_bar, text="+ Add Section",
+            bg=COLORS["loop_accent"], fg=COLORS["bg"],
             font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2",
-            command=self._add_section,
-        )
+            command=self._add_section)
         self.add_section_btn.pack(side="left", padx=(16, 0))
 
-        # ---- Status ----
+        # ---- Status label ----
         self.status_var = tk.StringVar(value="Ready")
-        tk.Label(self.card, textvariable=self.status_var, bg=COLORS["card"],
-                 fg=COLORS["subtext"], font=("Segoe UI", 8), anchor="w").pack(
-            fill="x", padx=10)
+        self.status_lbl = tk.Label(
+            self.card, textvariable=self.status_var,
+            bg=COLORS["card"], fg=COLORS["subtext"],
+            font=("Segoe UI", 8), anchor="w")
+        self.status_lbl.pack(fill="x", padx=10)
 
         # ---- Sections container ----
         self.sections_frame = tk.Frame(self.card, bg=COLORS["step_bg"], pady=4)
@@ -420,11 +768,39 @@ class TaskCard:
         self._refresh_ui()
 
     # ------------------------------------------------------------------
-    # Loop toggle
+    # Pause / Resume / Stop handlers (manual)
+    # ------------------------------------------------------------------
+    def _toggle_pause(self):
+        if self._pause_mgr is None:
+            return
+        if self._pause_mgr.is_paused and self._pause_mgr.manual_pause_active:
+            # Currently manually paused → resume
+            self._pause_mgr.manual_resume()
+            self.pause_btn.config(text="\u23f8  Pause", bg=COLORS["pause_bg"])
+            self._update_status_color()
+        else:
+            # Running (or auto-paused) → manual pause
+            self._pause_mgr.manual_pause()
+            self.pause_btn.config(text="\u25b6  Resume", bg=COLORS["green"])
+            self._update_status_color()
+
+    def _stop_task(self):
+        if self._pause_mgr is not None:
+            self._pause_mgr.stop()
+        self.status_var.set("\u23f9 Stopped by user")
+        self._on_task_finished()
+
+    def _update_status_color(self):
+        if self._pause_mgr and self._pause_mgr.is_paused:
+            self.status_lbl.config(fg=COLORS["yellow"])
+        else:
+            self.status_lbl.config(fg=COLORS["subtext"])
+
+    # ------------------------------------------------------------------
+    # Loop toggle helpers
     # ------------------------------------------------------------------
     def _on_loop_toggle(self):
-        enabled = self.loop_enabled_var.get()
-        self.task_data["loop_enabled"] = enabled
+        self.task_data["loop_enabled"] = self.loop_enabled_var.get()
         self.app_ref.save_data()
         self._refresh_ui()
 
@@ -443,23 +819,23 @@ class TaskCard:
         name = simpledialog.askstring(
             "New Section", "Enter section name:",
             initialvalue=f"Section {len(self.task_data['sections']) + 1}",
-            parent=self.app_ref.root,
-        )
+            parent=self.app_ref.root)
         if name and name.strip():
             self.task_data["sections"].append(
-                {"name": name.strip(), "loop_count": 0, "steps": []}
-            )
+                {"name": name.strip(), "loop_count": 0, "steps": []})
             self.app_ref.save_data()
             self._refresh_ui()
 
     def _delete_section(self, sec_idx):
         if len(self.task_data["sections"]) <= 1:
-            messagebox.showwarning("Cannot Delete",
-                                   "A task must have at least one section.",
-                                   parent=self.app_ref.root)
+            messagebox.showwarning(
+                "Cannot Delete",
+                "A task must have at least one section.",
+                parent=self.app_ref.root)
             return
-        if messagebox.askyesno("Delete Section",
-                               f"Delete section '{self.task_data['sections'][sec_idx]['name']}'?"):
+        if messagebox.askyesno(
+                "Delete Section",
+                f"Delete section '{self.task_data['sections'][sec_idx]['name']}'?"):
             self.task_data["sections"].pop(sec_idx)
             self.app_ref.save_data()
             self._refresh_ui()
@@ -468,8 +844,7 @@ class TaskCard:
         sec = self.task_data["sections"][sec_idx]
         new_name = simpledialog.askstring(
             "Rename Section", "Enter new section name:",
-            initialvalue=sec["name"], parent=self.app_ref.root,
-        )
+            initialvalue=sec["name"], parent=self.app_ref.root)
         if new_name and new_name.strip():
             sec["name"] = new_name.strip()
             self.app_ref.save_data()
@@ -480,8 +855,6 @@ class TaskCard:
     # ------------------------------------------------------------------
     def _refresh_ui(self):
         loop_enabled = self.loop_enabled_var.get()
-
-        # Show/hide loop-related controls
         if loop_enabled:
             self.loop_count_spin.config(state="normal")
             self.add_section_btn.pack(side="left", padx=(16, 0))
@@ -489,88 +862,99 @@ class TaskCard:
             self.loop_count_spin.config(state="disabled")
             self.add_section_btn.pack_forget()
 
-        for widget in self.sections_frame.winfo_children():
-            widget.destroy()
+        for w in self.sections_frame.winfo_children():
+            w.destroy()
 
-        sections = self.task_data.get("sections", [])
-        for sec_idx, section in enumerate(sections):
+        for sec_idx, section in enumerate(self.task_data.get("sections", [])):
             self._build_section(sec_idx, section, loop_enabled)
 
     def _build_section(self, sec_idx, section, loop_enabled):
-        # Section container
-        sec_frame = tk.Frame(self.sections_frame, bg=COLORS["section_bg"],
-                             highlightthickness=1,
-                             highlightbackground=COLORS["border"] if not loop_enabled
-                             else COLORS["loop_accent"])
+        sec_frame = tk.Frame(
+            self.sections_frame, bg=COLORS["section_bg"],
+            highlightthickness=1,
+            highlightbackground=(
+                COLORS["loop_accent"] if loop_enabled else COLORS["border"]))
         sec_frame.pack(fill="x", padx=4, pady=4)
 
-        # Section header
         sec_header = tk.Frame(sec_frame, bg=COLORS["section_header"])
         sec_header.pack(fill="x")
 
-        # Section name label
-        tk.Label(sec_header,
-                 text=f"\U0001f4c2  {section['name']}",
-                 bg=COLORS["section_header"],
-                 fg=COLORS["loop_accent"] if loop_enabled else COLORS["accent2"],
-                 font=("Segoe UI", 9, "bold")).pack(side="left", padx=8, pady=4)
+        tk.Label(
+            sec_header,
+            text=f"\U0001f4c2  {section['name']}",
+            bg=COLORS["section_header"],
+            fg=COLORS["loop_accent"] if loop_enabled else COLORS["accent2"],
+            font=("Segoe UI", 9, "bold")
+        ).pack(side="left", padx=8, pady=4)
 
-        # Loop count for this section (only visible when loop enabled)
         if loop_enabled:
-            tk.Label(sec_header, text="Loop:", bg=COLORS["section_header"],
-                     fg=COLORS["subtext"], font=("Segoe UI", 8)).pack(side="left", padx=(8, 2))
+            tk.Label(sec_header, text="Loop:",
+                     bg=COLORS["section_header"],
+                     fg=COLORS["subtext"],
+                     font=("Segoe UI", 8)).pack(side="left", padx=(8, 2))
 
             sec_loop_var = tk.IntVar(value=section.get("loop_count", 0))
 
-            def make_sec_loop_handler(idx, var):
-                def handler(*args):
+            def make_handler(idx, var):
+                def h(*_):
                     try:
                         self.task_data["sections"][idx]["loop_count"] = int(var.get())
                     except Exception:
                         self.task_data["sections"][idx]["loop_count"] = 0
                     self.app_ref.save_data()
-                return handler
+                return h
 
             sec_spin = tk.Spinbox(
-                sec_header, from_=0, to=9999, textvariable=sec_loop_var,
+                sec_header, from_=0, to=9999,
+                textvariable=sec_loop_var,
                 bg=COLORS["section_header"], fg=COLORS["loop_accent"],
                 buttonbackground=COLORS["border"],
                 font=("Segoe UI", 8, "bold"), width=5, relief="flat",
-                command=make_sec_loop_handler(sec_idx, sec_loop_var),
-            )
+                command=make_handler(sec_idx, sec_loop_var))
             sec_spin.pack(side="left", padx=(0, 4))
-            sec_spin.bind("<FocusOut>", make_sec_loop_handler(sec_idx, sec_loop_var))
+            sec_spin.bind("<FocusOut>", make_handler(sec_idx, sec_loop_var))
 
-            # Loop count hint
-            hint = "(0 = no loop)" if section.get("loop_count", 0) == 0 else f"\u21ba {section.get('loop_count')}x"
-            tk.Label(sec_header, text=hint,
-                     bg=COLORS["section_header"],
-                     fg=COLORS["yellow"] if section.get("loop_count", 0) > 0 else COLORS["subtext"],
-                     font=("Segoe UI", 8, "italic")).pack(side="left", padx=2)
+            lc = section.get("loop_count", 0)
+            hint = "(0 = no loop)" if lc == 0 else f"\u21ba {lc}x"
+            tk.Label(
+                sec_header, text=hint,
+                bg=COLORS["section_header"],
+                fg=COLORS["yellow"] if lc > 0 else COLORS["subtext"],
+                font=("Segoe UI", 8, "italic")
+            ).pack(side="left", padx=2)
 
-        # Section action buttons
         sec_btns = tk.Frame(sec_header, bg=COLORS["section_header"])
         sec_btns.pack(side="right", padx=4)
 
-        tk.Button(sec_btns, text="+ Step", bg=COLORS["accent2"], fg=COLORS["bg"],
-                  font=("Segoe UI", 8, "bold"), relief="flat", cursor="hand2",
-                  command=lambda i=sec_idx: self._add_step(i)).pack(side="left", padx=2, pady=2)
+        tk.Button(
+            sec_btns, text="+ Step",
+            bg=COLORS["accent2"], fg=COLORS["bg"],
+            font=("Segoe UI", 8, "bold"), relief="flat", cursor="hand2",
+            command=lambda i=sec_idx: self._add_step(i)
+        ).pack(side="left", padx=2, pady=2)
 
         if loop_enabled:
-            tk.Button(sec_btns, text="Rename", bg=COLORS["border"], fg=COLORS["text"],
-                      font=("Segoe UI", 8), relief="flat", cursor="hand2",
-                      command=lambda i=sec_idx: self._rename_section(i)).pack(side="left", padx=2, pady=2)
+            tk.Button(
+                sec_btns, text="Rename",
+                bg=COLORS["border"], fg=COLORS["text"],
+                font=("Segoe UI", 8), relief="flat", cursor="hand2",
+                command=lambda i=sec_idx: self._rename_section(i)
+            ).pack(side="left", padx=2, pady=2)
+            tk.Button(
+                sec_btns, text="\u2715 Del",
+                bg=COLORS["red"], fg=COLORS["bg"],
+                font=("Segoe UI", 8, "bold"), relief="flat", cursor="hand2",
+                command=lambda i=sec_idx: self._delete_section(i)
+            ).pack(side="left", padx=2, pady=2)
 
-            tk.Button(sec_btns, text="\u2715 Del", bg=COLORS["red"], fg=COLORS["bg"],
-                      font=("Segoe UI", 8, "bold"), relief="flat", cursor="hand2",
-                      command=lambda i=sec_idx: self._delete_section(i)).pack(side="left", padx=2, pady=2)
-
-        # Steps inside section
         steps = section.get("steps", [])
         if not steps:
-            tk.Label(sec_frame, text="No steps. Click '+ Step' to add.",
-                     bg=COLORS["section_bg"], fg=COLORS["subtext"],
-                     font=("Segoe UI", 8, "italic")).pack(padx=12, pady=4, anchor="w")
+            tk.Label(
+                sec_frame,
+                text="No steps. Click '+ Step' to add.",
+                bg=COLORS["section_bg"], fg=COLORS["subtext"],
+                font=("Segoe UI", 8, "italic")
+            ).pack(padx=12, pady=4, anchor="w")
         else:
             for step_idx, step in enumerate(steps):
                 self._build_step_row(sec_frame, sec_idx, step_idx, step)
@@ -588,9 +972,11 @@ class TaskCard:
         action = step.get("action", "Click")
         color = action_colors.get(action, COLORS["text"])
 
-        tk.Label(row, text=f" {step_idx + 1} ", bg=color, fg=COLORS["bg"],
+        tk.Label(row, text=f" {step_idx + 1} ",
+                 bg=color, fg=COLORS["bg"],
                  font=("Segoe UI", 8, "bold"), width=3).pack(side="left", padx=(0, 4))
-        tk.Label(row, text=f"[{action}]", bg=COLORS["section_bg"], fg=color,
+        tk.Label(row, text=f"[{action}]",
+                 bg=COLORS["section_bg"], fg=color,
                  font=("Segoe UI", 9, "bold"), width=10, anchor="w").pack(side="left")
         tk.Label(row, text=f"({step.get('x', 0)}, {step.get('y', 0)})",
                  bg=COLORS["section_bg"], fg=COLORS["subtext"],
@@ -599,7 +985,8 @@ class TaskCard:
         desc = step.get("description") or step.get("text", "")
         if len(desc) > 28:
             desc = desc[:25] + "..."
-        tk.Label(row, text=desc, bg=COLORS["section_bg"], fg=COLORS["text"],
+        tk.Label(row, text=desc,
+                 bg=COLORS["section_bg"], fg=COLORS["text"],
                  font=("Segoe UI", 9), anchor="w").pack(side="left", padx=(4, 0))
 
         tk.Button(row, text="Edit", bg=COLORS["border"], fg=COLORS["text"],
@@ -623,8 +1010,9 @@ class TaskCard:
     # Step CRUD
     # ------------------------------------------------------------------
     def _add_step(self, sec_idx):
-        StepEditorDialog(self.app_ref.root,
-                         on_save=lambda step: self._on_step_saved(sec_idx, step))
+        StepEditorDialog(
+            self.app_ref.root,
+            on_save=lambda step: self._on_step_saved(sec_idx, step))
 
     def _on_step_saved(self, sec_idx, step):
         self.task_data["sections"][sec_idx].setdefault("steps", []).append(step)
@@ -662,16 +1050,22 @@ class TaskCard:
         new_name = simpledialog.askstring(
             "Rename Task", "Enter new task name:",
             initialvalue=self.task_data.get("name", ""),
-            parent=self.app_ref.root,
-        )
+            parent=self.app_ref.root)
         if new_name and new_name.strip():
             self.task_data["name"] = new_name.strip()
             self.name_var.set(new_name.strip())
             self.app_ref.save_data()
 
     def _delete_task(self):
-        if messagebox.askyesno("Delete Task",
-                               f"Delete task '{self.task_data.get('name')}'? This cannot be undone."):
+        if self.is_running:
+            messagebox.showwarning(
+                "Task Running",
+                "Stop the task before deleting.",
+                parent=self.app_ref.root)
+            return
+        if messagebox.askyesno(
+                "Delete Task",
+                f"Delete task '{self.task_data.get('name')}'? This cannot be undone."):
             self.app_ref.delete_task(self.index)
 
     # ------------------------------------------------------------------
@@ -680,17 +1074,64 @@ class TaskCard:
     def _run_task(self):
         if self.is_running:
             return
-        # Validate at least one step exists
-        total_steps = sum(len(s.get("steps", [])) for s in self.task_data.get("sections", []))
+        total_steps = sum(
+            len(s.get("steps", []))
+            for s in self.task_data.get("sections", []))
         if total_steps == 0:
             messagebox.showinfo("No Steps", "This task has no steps to run.")
             return
         self._save_loop_settings()
+
+        # Collect all automation coords for smart mouse-ignore
+        coords = []
+        for sec in self.task_data.get("sections", []):
+            for step in sec.get("steps", []):
+                coords.append((step.get("x", 0), step.get("y", 0)))
+
+        # Create pause manager
+        def on_status(msg):
+            self.status_var.set(msg)
+            # Sync pause button label
+            if self._pause_mgr:
+                if self._pause_mgr.is_paused and self._pause_mgr.manual_pause_active:
+                    self.pause_btn.config(text="\u25b6  Resume", bg=COLORS["green"])
+                    self.status_lbl.config(fg=COLORS["yellow"])
+                elif self._pause_mgr.is_paused:
+                    # auto-paused
+                    self.pause_btn.config(text="\u23f8  Pause", bg=COLORS["pause_bg"])
+                    self.status_lbl.config(fg=COLORS["yellow"])
+                else:
+                    self.pause_btn.config(text="\u23f8  Pause", bg=COLORS["pause_bg"])
+                    self.status_lbl.config(fg=COLORS["subtext"])
+
+        self._pause_mgr = AutoPauseManager(
+            on_status_update=lambda msg: self.app_ref.root.after(0, lambda m=msg: on_status(m)),
+            root_widget=self.app_ref.root)
+        self._pause_mgr.start(automation_coords=coords)
+
         self.is_running = True
-        self.run_btn.config(text="\u23f3 Running...", state="disabled", bg=COLORS["yellow"])
+        self.run_btn.config(text="\u23f3 Running...",
+                            state="disabled", bg=COLORS["yellow"])
+        self.pause_btn.config(state="normal")
+        self.stop_btn.config(state="normal")
         self.status_var.set("Running...")
+
         threading.Thread(target=self._execute_task, daemon=True).start()
 
+    def _on_task_finished(self):
+        """Restore UI after task ends (call from any thread via root.after)."""
+        self.is_running = False
+        self._pause_mgr = None
+        self.run_btn.config(text="\u25b6  Run Task",
+                            state="normal", bg=COLORS["green"])
+        self.pause_btn.config(text="\u23f8  Pause",
+                              state="disabled", bg=COLORS["pause_bg"])
+        self.stop_btn.config(state="disabled")
+        self.status_lbl.config(fg=COLORS["subtext"])
+
+    # ------------------------------------------------------------------
+    # Execute a single automation step
+    # ------------------------------------------------------------------
     def _execute_step(self, step):
         action = step.get("action", "Click")
         x, y = step.get("x", 0), step.get("y", 0)
@@ -720,71 +1161,91 @@ class TaskCard:
             pyautogui.click(x, y)
             time.sleep(0.2)
             pyautogui.typewrite(text, interval=0.08)
+
         time.sleep(delay)
 
+    # ------------------------------------------------------------------
+    # Main execution engine  (pause-aware)
+    # ------------------------------------------------------------------
     def _execute_task(self):
+        pm = self._pause_mgr
         loop_enabled = self.task_data.get("loop_enabled", False)
         task_loop_count = max(1, self.task_data.get("loop_count", 1))
         sections = self.task_data.get("sections", [])
 
+        def run_section_once(sec, iteration_label=""):
+            """Run all steps in a section; return False if stopped."""
+            for step_idx, step in enumerate(sec.get("steps", [])):
+                # ---- PAUSE POINT ----
+                if not pm.wait_if_paused():
+                    return False   # stopped
+                label = (
+                    f"{iteration_label}"
+                    f"[{sec['name']}] Step {step_idx + 1}: {step.get('action')}"
+                )
+                pm.on_status_update(label)
+                self._execute_step(step)
+                if pm.is_stopped:
+                    return False
+            return True
+
         try:
+            pm.automation_running = True
+
             if not loop_enabled:
-                # No loop: run all sections once, straight through
                 for sec in sections:
-                    for step_idx, step in enumerate(sec.get("steps", [])):
-                        self.status_var.set(
-                            f"[{sec['name']}] Step {step_idx + 1}: {step.get('action')}"
-                        )
-                        self._execute_step(step)
+                    if not run_section_once(sec):
+                        raise StopIteration
             else:
-                # Loop mode: repeat for task_loop_count iterations
                 for iteration in range(1, task_loop_count + 1):
-                    self.status_var.set(f"Loop iteration {iteration}/{task_loop_count}...")
+                    if pm.is_stopped:
+                        break
+                    iter_lbl = f"[Iter {iteration}/{task_loop_count}] "
                     for sec in sections:
+                        if pm.is_stopped:
+                            break
                         sec_loop = sec.get("loop_count", 0)
                         steps = sec.get("steps", [])
                         if not steps:
                             continue
 
                         if sec_loop == 0:
-                            # Section loop count is 0 -> run once (no looping)
-                            for step_idx, step in enumerate(steps):
-                                self.status_var.set(
-                                    f"[Iter {iteration}/{task_loop_count}] "
-                                    f"[{sec['name']}] Step {step_idx + 1}: {step.get('action')}"
-                                )
-                                self._execute_step(step)
+                            if not run_section_once(sec, iter_lbl):
+                                raise StopIteration
                         else:
-                            # Section loops sec_loop times
                             for sec_iter in range(1, sec_loop + 1):
-                                for step_idx, step in enumerate(steps):
-                                    self.status_var.set(
-                                        f"[Iter {iteration}/{task_loop_count}] "
-                                        f"[{sec['name']} Loop {sec_iter}/{sec_loop}] "
-                                        f"Step {step_idx + 1}: {step.get('action')}"
-                                    )
-                                    self._execute_step(step)
+                                if pm.is_stopped:
+                                    break
+                                sl = (f"{iter_lbl}"
+                                      f"[{sec['name']} Loop {sec_iter}/{sec_loop}] ")
+                                if not run_section_once(sec, sl):
+                                    raise StopIteration
 
-            self.status_var.set("\u2705 Completed successfully")
+            if not pm.is_stopped:
+                pm.on_status_update("\u2705 Completed successfully")
+
+        except StopIteration:
+            pass
         except pyautogui.FailSafeException:
-            self.status_var.set("\u274c Stopped: Failsafe triggered (mouse moved to corner)")
+            pm.on_status_update(
+                "\u274c Stopped: Failsafe triggered (mouse moved to corner)")
         except Exception as e:
-            self.status_var.set(f"\u274c Error: {str(e)}")
+            pm.on_status_update(f"\u274c Error: {e}")
         finally:
-            self.is_running = False
-            self.run_btn.config(text="\u25b6  Run Task", state="normal", bg=COLORS["green"])
+            pm.stop()
+            self.app_ref.root.after(0, self._on_task_finished)
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # AutoFlowApp
-# ---------------------------------------------------------------------------
+# ===========================================================================
 class AutoFlowApp:
     """Main AutoFlow application."""
 
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("AutoFlow \u2014 PyAutoGUI Task Automation Builder")
-        self.root.geometry("960x720")
+        self.root.geometry("980x720")
         self.root.configure(bg=COLORS["bg"])
         self.root.minsize(700, 500)
 
@@ -800,29 +1261,37 @@ class AutoFlowApp:
         topbar.pack(fill="x", side="top")
         topbar.pack_propagate(False)
 
-        tk.Label(topbar, text="\u26a1 AutoFlow", bg=COLORS["sidebar"],
-                 fg=COLORS["accent"], font=("Segoe UI", 16, "bold")).pack(
-            side="left", padx=16, pady=10)
-        tk.Label(topbar, text="PyAutoGUI Task Automation Builder",
-                 bg=COLORS["sidebar"], fg=COLORS["subtext"],
-                 font=("Segoe UI", 9)).pack(side="left", padx=4, pady=10)
-        tk.Button(topbar, text="\uff0b New Task", bg=COLORS["accent"], fg=COLORS["bg"],
-                  font=("Segoe UI", 10, "bold"), relief="flat", cursor="hand2",
-                  padx=14, pady=6, command=self._create_task).pack(
-            side="right", padx=12, pady=10)
+        tk.Label(
+            topbar, text="\u26a1 AutoFlow",
+            bg=COLORS["sidebar"], fg=COLORS["accent"],
+            font=("Segoe UI", 16, "bold")
+        ).pack(side="left", padx=16, pady=10)
+        tk.Label(
+            topbar, text="PyAutoGUI Task Automation Builder",
+            bg=COLORS["sidebar"], fg=COLORS["subtext"],
+            font=("Segoe UI", 9)
+        ).pack(side="left", padx=4, pady=10)
+        tk.Button(
+            topbar, text="\uff0b New Task",
+            bg=COLORS["accent"], fg=COLORS["bg"],
+            font=("Segoe UI", 10, "bold"), relief="flat",
+            cursor="hand2", padx=14, pady=6,
+            command=self._create_task
+        ).pack(side="right", padx=12, pady=10)
 
         container = tk.Frame(self.root, bg=COLORS["bg"])
         container.pack(fill="both", expand=True)
 
         self.canvas = tk.Canvas(container, bg=COLORS["bg"], highlightthickness=0)
-        scrollbar = ttk.Scrollbar(container, orient="vertical", command=self.canvas.yview)
+        scrollbar = ttk.Scrollbar(container, orient="vertical",
+                                  command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
         self.canvas.pack(side="left", fill="both", expand=True)
 
         self.scroll_frame = tk.Frame(self.canvas, bg=COLORS["bg"])
-        self.canvas_window = self.canvas.create_window((0, 0), window=self.scroll_frame,
-                                                       anchor="nw")
+        self.canvas_window = self.canvas.create_window(
+            (0, 0), window=self.scroll_frame, anchor="nw")
         self.scroll_frame.bind("<Configure>", self._on_frame_configure)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
@@ -830,10 +1299,13 @@ class AutoFlowApp:
         footer = tk.Frame(self.root, bg=COLORS["sidebar"], height=28)
         footer.pack(fill="x", side="bottom")
         footer.pack_propagate(False)
-        tk.Label(footer,
-                 text="Tip: Enable Loop on a task to use Sections. Section loop_count=0 means run once without looping.",
-                 bg=COLORS["sidebar"], fg=COLORS["subtext"],
-                 font=("Segoe UI", 8)).pack(side="left", padx=12)
+        tk.Label(
+            footer,
+            text=("Tip: Auto-pause activates when user mouse/keyboard activity is "
+                  "detected during automation. Use \u23f8 Pause / \u23f9 Stop for manual control."),
+            bg=COLORS["sidebar"], fg=COLORS["subtext"],
+            font=("Segoe UI", 8)
+        ).pack(side="left", padx=12)
 
     def _on_frame_configure(self, event):
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
@@ -845,8 +1317,8 @@ class AutoFlowApp:
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     def _create_task(self):
-        name = simpledialog.askstring("New Task", "Enter a name for the new task:",
-                                      parent=self.root)
+        name = simpledialog.askstring(
+            "New Task", "Enter a name for the new task:", parent=self.root)
         if name and name.strip():
             task = {
                 "name": name.strip(),
@@ -859,15 +1331,17 @@ class AutoFlowApp:
             self._render_tasks()
 
     def _render_tasks(self):
-        for widget in self.scroll_frame.winfo_children():
-            widget.destroy()
+        for w in self.scroll_frame.winfo_children():
+            w.destroy()
         self.task_cards = []
 
         if not self.tasks:
-            tk.Label(self.scroll_frame,
-                     text="No tasks yet.\nClick '\uff0b New Task' to get started!",
-                     bg=COLORS["bg"], fg=COLORS["subtext"],
-                     font=("Segoe UI", 13), justify="center").pack(pady=80)
+            tk.Label(
+                self.scroll_frame,
+                text="No tasks yet.\nClick '\uff0b New Task' to get started!",
+                bg=COLORS["bg"], fg=COLORS["subtext"],
+                font=("Segoe UI", 13), justify="center"
+            ).pack(pady=80)
             return
 
         for i, task in enumerate(self.tasks):
