@@ -5,7 +5,7 @@ import os
 import time
 import threading
 import pyautogui
-from PIL import ImageGrab, ImageTk
+from PIL import ImageGrab, ImageTk, ImageDraw, ImageFont
 import copy
 
 DATA_FILE = "autoflow_tasks.json"
@@ -105,12 +105,123 @@ COLORS = {
     "shortcut_accent": "#f5c2e7",
     "shortcut_bg": "#24273a",
     "shortcut_header": "#1e2030",
-    "launcher_accent": "#a6e3a1",   # bright green for launcher
+    "launcher_accent": "#a6e3a1",
     "launcher_bg": "#1e3a2e",
+    "preview_btn": "#f9e2af",
 }
+
+# Palette for multiple coordinate markers
+_PREVIEW_PALETTE = [
+    "#f38ba8", "#a6e3a1", "#89b4fa", "#f9e2af", "#cba6f7",
+    "#fab387", "#94e2d5", "#f5c2e7", "#b4befe", "#74c7ec",
+]
 
 pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0.05
+
+
+# ===========================================================================
+# CoordinatePreviewOverlay
+# ===========================================================================
+class CoordinatePreviewOverlay:
+    """
+    Shows a fullscreen overlay on top of a live screenshot with crosshair
+    markers at each supplied coordinate.
+
+    coords_info: list of dicts  {x, y, label, color (optional)}
+    parent     : tk widget (used only as Toplevel owner)
+    """
+
+    RADIUS = 18
+    CROSSHAIR_LEN = 28
+    FONT_SIZE = 11
+
+    def __init__(self, parent, coords_info):
+        self.parent = parent
+        self.coords_info = coords_info
+        self._build()
+
+    # ------------------------------------------------------------------
+    def _build(self):
+        try:
+            screenshot = ImageGrab.grab()
+        except Exception as e:
+            messagebox.showerror("Screenshot Error",
+                                 f"Failed to capture screen: {e}", parent=self.parent)
+            return
+
+        ov = tk.Toplevel(self.parent)
+        ov.title("Coordinate Preview")
+        ov.attributes("-fullscreen", True)
+        ov.attributes("-topmost", True)
+        ov.overrideredirect(True)
+
+        canvas = tk.Canvas(ov, cursor="arrow", highlightthickness=0)
+        canvas.pack(fill=tk.BOTH, expand=True)
+
+        tk_image = ImageTk.PhotoImage(screenshot)
+        canvas.create_image(0, 0, anchor=tk.NW, image=tk_image)
+        canvas.image = tk_image
+
+        sw, sh = screenshot.width, screenshot.height
+
+        # ---- draw markers ----
+        for idx, info in enumerate(self.coords_info):
+            x = info.get("x", 0)
+            y = info.get("y", 0)
+            label = info.get("label", f"#{idx+1}")
+            color = info.get("color", _PREVIEW_PALETTE[idx % len(_PREVIEW_PALETTE)])
+
+            r = self.RADIUS
+            cl = self.CROSSHAIR_LEN
+
+            # semi-transparent filled circle (simulate with stipple)
+            canvas.create_oval(x - r, y - r, x + r, y + r,
+                               outline=color, fill=color, stipple="gray50", width=2)
+            # solid ring border
+            canvas.create_oval(x - r, y - r, x + r, y + r,
+                               outline=color, fill="", width=2)
+            # crosshair lines
+            canvas.create_line(x - cl, y, x + cl, y, fill=color, width=2)
+            canvas.create_line(x, y - cl, x, y + cl, fill=color, width=2)
+
+            # tooltip bubble
+            pad = 5
+            tooltip_x = x + r + 6
+            tooltip_y = y - r - 6
+            # clamp to screen
+            if tooltip_x + 180 > sw:
+                tooltip_x = x - r - 186
+            if tooltip_y < 4:
+                tooltip_y = y + r + 6
+
+            bg_rect = canvas.create_rectangle(
+                tooltip_x - pad, tooltip_y - pad,
+                tooltip_x + 175, tooltip_y + 18 + pad,
+                fill="#11111b", outline=color, width=1)
+            canvas.create_text(
+                tooltip_x, tooltip_y, anchor="nw",
+                text=label, fill=color, font=("Consolas", self.FONT_SIZE, "bold"))
+
+        # ---- instruction bar ----
+        bar_h = 46
+        bar_y = sh - bar_h - 8
+        canvas.create_rectangle(8, bar_y, sw - 8, bar_y + bar_h,
+                                 fill="#11111b", outline="#cba6f7", width=2)
+        canvas.create_text(sw // 2, bar_y + bar_h // 2,
+                           text=f"  \U0001f441  Coordinate Preview  —  {len(self.coords_info)} point(s)  |  Click anywhere or press ESC to close  ",
+                           fill="#cdd6f4", font=("Segoe UI", 13, "bold"))
+
+        # ---- close bindings ----
+        def close(_event=None):
+            ov.grab_release()
+            ov.destroy()
+
+        canvas.bind("<Button-1>", close)
+        ov.bind("<Escape>", close)
+        ov.update()
+        ov.focus_force()
+        ov.grab_set()
 
 
 # ===========================================================================
@@ -502,6 +613,14 @@ class StepEditorDialog:
             cursor="hand2", command=self._pick_coordinate)
         self.pick_btn.pack(side="left", padx=(0, 4))
 
+        # ---- Preview Coordinate button (NEW) ----
+        self.preview_coord_btn = tk.Button(
+            coord_row, text="\U0001f441 Preview",
+            bg=COLORS["preview_btn"], fg=COLORS["bg"],
+            font=("Segoe UI", 9, "bold"), relief="flat",
+            cursor="hand2", command=self._preview_coordinate)
+        self.preview_coord_btn.pack(side="left", padx=(0, 4))
+
         self._lbl(frame, "Text to Type (for Input / Typewrite)", 6)
         self.text_var = tk.StringVar(value=self.step_data.get("text", ""))
         self.text_entry = tk.Entry(
@@ -615,6 +734,7 @@ class StepEditorDialog:
         self.x_entry.config(state=coord_state)
         self.y_entry.config(state=coord_state)
         self.pick_btn.config(state=coord_state)
+        self.preview_coord_btn.config(state=coord_state)
         self.enter_info.grid_remove()
         self.shortcut_info.grid_remove()
         if is_enter:
@@ -641,6 +761,51 @@ class StepEditorDialog:
                 self.x_var.set(x)
                 self.y_var.set(y)
         CoordinateSelector(self.parent, on_coord)
+
+    # ---- NEW: preview a single coordinate from the editor ----
+    def _preview_coordinate(self):
+        try:
+            x = int(self.x_var.get())
+            y = int(self.y_var.get())
+        except (tk.TclError, ValueError):
+            messagebox.showwarning("Invalid Coordinate",
+                                   "Please enter valid integer X and Y values.",
+                                   parent=self.win)
+            return
+        action = self.action_var.get()
+        desc = self.desc_var.get().strip() or action
+        label = f"Step  [{action}]  ({x}, {y})  {desc[:28]}"
+        self.win.withdraw()
+        self.parent.iconify()
+        self.win.after(250, lambda: self._show_preview(x, y, label))
+
+    def _show_preview(self, x, y, label):
+        def _after_close():
+            self.parent.deiconify()
+            self.win.deiconify()
+            self.win.lift()
+            self.win.focus_force()
+
+        coords_info = [{"x": x, "y": y, "label": label, "color": "#f9e2af"}]
+        ov = tk.Toplevel(self.parent)
+        ov.withdraw()
+        ov.destroy()
+        # Use overlay directly; bind close callback via after
+        CoordinatePreviewOverlay(self.parent, coords_info)
+        self.parent.after(100, lambda: None)
+        # Schedule restore after a short polling interval
+        self._wait_and_restore(_after_close)
+
+    def _wait_and_restore(self, callback, _tries=0):
+        # Poll until the overlay window is gone (focus returns to root or dialog)
+        try:
+            focused = self.parent.focus_displayof()
+        except Exception:
+            focused = None
+        if focused is not None or _tries > 60:
+            callback()
+        else:
+            self.parent.after(100, lambda: self._wait_and_restore(callback, _tries + 1))
 
     def _save(self):
         action = self.action_var.get()
@@ -689,7 +854,6 @@ class TaskCard:
             self.task_data["loop_enabled"] = False
         if "loop_count" not in self.task_data:
             self.task_data["loop_count"] = 1
-        # launcher_icon: {"x": int, "y": int, "enabled": bool}
         if "launcher_icon" not in self.task_data:
             self.task_data["launcher_icon"] = {"enabled": False, "x": 0, "y": 0}
         if "steps" in self.task_data and "sections" not in self.task_data:
@@ -743,6 +907,14 @@ class TaskCard:
             font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2",
             state="disabled", command=self._stop_task)
         self.stop_btn.pack(side="left", padx=4)
+
+        # ---- Preview All Coordinates button (NEW) ----
+        tk.Button(
+            btn_frame, text="\U0001f441 Preview All Coords",
+            bg=COLORS["preview_btn"], fg=COLORS["bg"],
+            font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2",
+            command=self._preview_all_coordinates
+        ).pack(side="left", padx=4)
 
         tk.Button(
             btn_frame, text="\u270e Rename",
@@ -815,10 +987,99 @@ class TaskCard:
         self._refresh_ui()
 
     # ------------------------------------------------------------------
+    # Coordinate Preview (NEW)
+    # ------------------------------------------------------------------
+    def _preview_all_coordinates(self):
+        """Collect all coordinates from every section/step + launcher and show overlay."""
+        coords_info = []
+        global_step_num = 0
+
+        # launcher icon
+        li = self.task_data.get("launcher_icon", {})
+        if li.get("enabled") and (li.get("x", 0) != 0 or li.get("y", 0) != 0):
+            coords_info.append({
+                "x": li["x"], "y": li["y"],
+                "label": f"\U0001f680 Launcher  ({li['x']}, {li['y']})",
+                "color": COLORS["launcher_accent"],
+            })
+
+        action_colors_map = {
+            "Click":            "#cba6f7",
+            "Input":            "#89b4fa",
+            "Scroll":           "#f9e2af",
+            "Typewrite":        "#a6e3a1",
+            "Press Enter":      "#94e2d5",
+            "Keyboard Shortcut":"#f5c2e7",
+        }
+
+        for sec in self.task_data.get("sections", []):
+            for step in sec.get("steps", []):
+                action = step.get("action", "Click")
+                if action in ("Press Enter", "Keyboard Shortcut"):
+                    continue
+                global_step_num += 1
+                x, y = step.get("x", 0), step.get("y", 0)
+                desc = step.get("description") or step.get("text", "")
+                if len(desc) > 20:
+                    desc = desc[:17] + "..."
+                label = f"#{global_step_num}  [{action}]  ({x}, {y})"
+                if desc:
+                    label += f"  {desc}"
+                coords_info.append({
+                    "x": x, "y": y,
+                    "label": label,
+                    "color": action_colors_map.get(action, "#cdd6f4"),
+                })
+
+        if not coords_info:
+            messagebox.showinfo(
+                "No Coordinates",
+                "This task has no coordinate-based steps to preview.\n"
+                "(Press Enter and Keyboard Shortcut steps don't use coordinates.)",
+                parent=self.app_ref.root)
+            return
+
+        self.app_ref.root.iconify()
+        self.app_ref.root.after(300, lambda: self._show_all_preview(coords_info))
+
+    def _show_all_preview(self, coords_info):
+        CoordinatePreviewOverlay(self.app_ref.root, coords_info)
+        # Restore main window after overlay is dismissed
+        self.app_ref.root.after(400, self.app_ref.root.deiconify)
+
+    def _preview_single_coordinate(self, step):
+        """Preview one step's coordinate on-screen."""
+        action = step.get("action", "Click")
+        x, y = step.get("x", 0), step.get("y", 0)
+        desc = step.get("description") or step.get("text", "")
+        if len(desc) > 22:
+            desc = desc[:19] + "..."
+        label = f"[{action}]  ({x}, {y})"
+        if desc:
+            label += f"  {desc}"
+        action_colors_map = {
+            "Click":      "#cba6f7",
+            "Input":      "#89b4fa",
+            "Scroll":     "#f9e2af",
+            "Typewrite":  "#a6e3a1",
+        }
+        color = action_colors_map.get(action, "#cdd6f4")
+        self.app_ref.root.iconify()
+        self.app_ref.root.after(
+            300,
+            lambda: (
+                CoordinatePreviewOverlay(
+                    self.app_ref.root,
+                    [{"x": x, "y": y, "label": label, "color": color}]
+                ),
+                self.app_ref.root.after(400, self.app_ref.root.deiconify),
+            )
+        )
+
+    # ------------------------------------------------------------------
     # Launcher Icon Bar
     # ------------------------------------------------------------------
     def _build_launcher_bar(self):
-        """Build the launcher icon row that sits above the Loop bar."""
         li = self.task_data["launcher_icon"]
 
         self.launcher_bar = tk.Frame(self.card, bg=COLORS["launcher_bg"],
@@ -826,7 +1087,6 @@ class TaskCard:
                                      highlightbackground=COLORS["launcher_accent"])
         self.launcher_bar.pack(fill="x", padx=10, pady=(0, 4))
 
-        # Checkbox to enable/disable
         self.launcher_enabled_var = tk.BooleanVar(value=li.get("enabled", False))
         tk.Checkbutton(
             self.launcher_bar,
@@ -840,7 +1100,6 @@ class TaskCard:
             command=self._on_launcher_toggle,
         ).pack(side="left", padx=(6, 0))
 
-        # Info label
         self.launcher_info_lbl = tk.Label(
             self.launcher_bar,
             text="(clicks app icon ONCE before loop starts)",
@@ -848,7 +1107,6 @@ class TaskCard:
             font=("Segoe UI", 8, "italic"))
         self.launcher_info_lbl.pack(side="left", padx=(6, 0))
 
-        # Coordinate display
         self.launcher_coord_var = tk.StringVar()
         self._update_launcher_coord_label()
         self.launcher_coord_lbl = tk.Label(
@@ -858,7 +1116,6 @@ class TaskCard:
             font=("Consolas", 9, "bold"))
         self.launcher_coord_lbl.pack(side="left", padx=(10, 0))
 
-        # Pick / Change position button
         self.launcher_pick_btn = tk.Button(
             self.launcher_bar,
             text="\U0001f4cd Set Position",
@@ -891,8 +1148,6 @@ class TaskCard:
         self.app_ref.save_data()
 
     def _pick_launcher_coord(self):
-        """Open fullscreen coordinate picker specifically for the launcher icon."""
-        # Hide main window and card's parent window
         self.app_ref.root.iconify()
         self.app_ref.root.after(250, self._do_pick_launcher)
 
@@ -1121,6 +1376,7 @@ class TaskCard:
                  bg=COLORS["section_bg"], fg=COLORS["text"],
                  font=("Segoe UI", 9), anchor="w").pack(side="left", padx=(4, 0))
 
+        # --- action buttons (right side) ---
         tk.Button(row, text="Edit", bg=COLORS["border"], fg=COLORS["text"],
                   font=("Segoe UI", 8), relief="flat", cursor="hand2",
                   command=lambda si=sec_idx, st=step_idx: self._edit_step(si, st)
@@ -1137,6 +1393,15 @@ class TaskCard:
                   font=("Segoe UI", 8), relief="flat", cursor="hand2",
                   command=lambda si=sec_idx, st=step_idx: self._move_step(si, st, -1)
                   ).pack(side="right", padx=1)
+
+        # ---- 👁 Preview button for this step (NEW) — only for coord-based actions ----
+        if not no_coord:
+            tk.Button(
+                row, text="\U0001f441",
+                bg=COLORS["preview_btn"], fg=COLORS["bg"],
+                font=("Segoe UI", 8, "bold"), relief="flat", cursor="hand2",
+                command=lambda s=step: self._preview_single_coordinate(s)
+            ).pack(side="right", padx=2)
 
     # ------------------------------------------------------------------
     # Step operations
@@ -1204,7 +1469,6 @@ class TaskCard:
             messagebox.showinfo("No Steps", "This task has no steps to run.")
             return
 
-        # Validate launcher if enabled
         li = self.task_data["launcher_icon"]
         if li.get("enabled") and li.get("x", 0) == 0 and li.get("y", 0) == 0:
             if not messagebox.askyesno(
@@ -1221,7 +1485,6 @@ class TaskCard:
             for step in sec.get("steps", [])
             if step.get("action") not in ("Press Enter", "Keyboard Shortcut")
         ]
-        # Also add launcher coord to known coords so monitor ignores it
         if li.get("enabled"):
             coords.append((li.get("x", 0), li.get("y", 0)))
 
@@ -1344,15 +1607,13 @@ class TaskCard:
         try:
             pm.automation_running = True
 
-            # ---- LAUNCHER CLICK (once, before anything else) ----
             if li.get("enabled") and (li.get("x", 0) != 0 or li.get("y", 0) != 0):
                 pm.on_status_update("\U0001f680 Launching app...")
                 pm.set_automation_moving(True)
                 pyautogui.click(li["x"], li["y"])
                 pm.set_automation_moving(False)
-                time.sleep(1.2)   # small pause to let app open/focus
+                time.sleep(1.2)
 
-            # ---- MAIN TASK (with or without loop) ----
             if not loop_enabled:
                 for sec in sections:
                     if not run_section_once(sec):
@@ -1396,7 +1657,7 @@ class TaskCard:
 class AutoFlowApp:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("AutoFlow v1.0 \u2014 PyAutoGUI Task Automation Builder")
+        self.root.title("AutoFlow v1.1 \u2014 PyAutoGUI Task Automation Builder")
         self.root.geometry("980x720")
         self.root.configure(bg=COLORS["bg"])
         self.root.minsize(700, 500)
@@ -1414,7 +1675,7 @@ class AutoFlowApp:
                  bg=COLORS["sidebar"], fg=COLORS["accent"],
                  font=("Segoe UI", 16, "bold")
                  ).pack(side="left", padx=16, pady=10)
-        tk.Label(topbar, text="v1.0  \u2014  PyAutoGUI Task Automation Builder",
+        tk.Label(topbar, text="v1.1  \u2014  PyAutoGUI Task Automation Builder",
                  bg=COLORS["sidebar"], fg=COLORS["subtext"],
                  font=("Segoe UI", 9)
                  ).pack(side="left", padx=4, pady=10)
@@ -1444,8 +1705,9 @@ class AutoFlowApp:
         footer.pack_propagate(False)
         tk.Label(
             footer,
-            text=("Tip: \U0001f680 Launcher Icon clicks app ONCE before loop. "
-                  "Auto-pause activates on mouse/keyboard activity. "
+            text=("Tip: \U0001f680 Launcher Icon clicks app ONCE before loop.  "
+                  "\U0001f441 Preview buttons show coordinates on-screen.  "
+                  "Auto-pause activates on mouse/keyboard activity.  "
                   "Use \u23f8 Pause / \u23f9 Stop for manual control."),
             bg=COLORS["sidebar"], fg=COLORS["subtext"],
             font=("Segoe UI", 8)
