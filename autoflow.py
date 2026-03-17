@@ -33,7 +33,7 @@ pyautogui.PAUSE = 0.3
 
 
 class CoordinateSelector:
-    """Full-screen transparent overlay for selecting a coordinate point by clicking."""
+    """Full-screen overlay for selecting a coordinate point by clicking."""
 
     def __init__(self, parent, callback):
         self.parent = parent
@@ -304,16 +304,25 @@ class StepEditorDialog:
         self.pick_btn.config(state=state_coord)
 
     def _pick_coordinate(self):
-        self.win.iconify()
-        time.sleep(0.4)
+        # Toplevel window cannot be iconified when set as transient.
+        # Instead, withdraw both the dialog and its parent, then
+        # restore them after coordinate selection — same pattern as sufianWG/uniapp.
+        self.win.withdraw()
+        self.parent.iconify()
+        self.win.after(200, self._initiate_coordinate_pick)
 
+    def _initiate_coordinate_pick(self):
         def on_coord(x, y):
+            # Restore parent root first, then the dialog
+            self.parent.deiconify()
             self.win.deiconify()
+            self.win.lift()
+            self.win.focus_force()
             if x is not None and y is not None:
                 self.x_var.set(x)
                 self.y_var.set(y)
 
-        CoordinateSelector(self.win, on_coord)
+        CoordinateSelector(self.parent, on_coord)
 
     def _save(self):
         self.step_data["action"] = self.action_var.get()
