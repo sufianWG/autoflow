@@ -12,10 +12,6 @@ DATA_FILE = "autoflow_tasks.json"
 
 ACTION_TYPES = ["Click", "Input", "Scroll", "Typewrite", "Press Enter", "Keyboard Shortcut"]
 
-# ---------------------------------------------------------------------------
-# All keyboard shortcuts grouped by category.
-# Each entry: (display_label, pyautogui_hotkey_args_tuple)
-# ---------------------------------------------------------------------------
 KEYBOARD_SHORTCUTS = {
     "\U0001f4cb  Edit": [
         ("Ctrl+C  — Copy",          ("ctrl", "c")),
@@ -109,10 +105,10 @@ COLORS = {
     "shortcut_accent": "#f5c2e7",
     "shortcut_bg": "#24273a",
     "shortcut_header": "#1e2030",
+    "launcher_accent": "#a6e3a1",   # bright green for launcher
+    "launcher_bg": "#1e3a2e",
 }
 
-# Disable PyAutoGUI failsafe to prevent top-left corner from stopping automation.
-# We handle stops ourselves via stop_event.
 pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0.05
 
@@ -140,19 +136,14 @@ class AutoPauseManager:
         self.pause_timestamp = None
         self.last_mouse_pos = None
         self.automation_running = False
-        # Flag: automation thread sets this True just before moving mouse,
-        # False right after -- so the monitor ignores those movements.
         self._automation_moving = False
         self._monitor_thread = None
         self._known_automation_coords = []
         self._kb_monitor_thread = None
-        self._last_kb_time = 0
 
     def set_automation_moving(self, moving: bool):
-        """Call with True before automation moves mouse, False after."""
         self._automation_moving = moving
         if moving:
-            # Update last known position so monitor doesn't false-trigger
             self.last_mouse_pos = pyautogui.position()
 
     def start(self, automation_coords=None):
@@ -255,7 +246,7 @@ class AutoPauseManager:
                 current_time = time.time()
                 if (self.automation_running and not self.pause_event.is_set()
                         and not self.manual_pause_active
-                        and not self._automation_moving   # <-- skip when automation is moving
+                        and not self._automation_moving
                         and self.last_mouse_pos is not None):
                     dx = current_pos.x - self.last_mouse_pos.x
                     dy = current_pos.y - self.last_mouse_pos.y
@@ -335,9 +326,10 @@ class AutoPauseManager:
 # CoordinateSelector
 # ===========================================================================
 class CoordinateSelector:
-    def __init__(self, parent, callback):
+    def __init__(self, parent, callback, title_text="Select Coordinate"):
         self.parent = parent
         self.callback = callback
+        self.title_text = title_text
         self._build()
 
     def _build(self):
@@ -349,7 +341,7 @@ class CoordinateSelector:
             self.callback(None, None)
             return
         sel_win = tk.Toplevel(self.parent)
-        sel_win.title("Select Coordinate")
+        sel_win.title(self.title_text)
         sel_win.attributes("-fullscreen", True)
         sel_win.attributes("-topmost", True)
         sel_win.overrideredirect(True)
@@ -360,7 +352,7 @@ class CoordinateSelector:
         canvas.image = tk_image
         screen_w, screen_h = screenshot.width, screenshot.height
         instruction_state = {"bg_id": None, "text_id": None}
-        INSTRUCTION_TEXT = "Click and drag to select target area  |  Press ESC to cancel"
+        INSTRUCTION_TEXT = f"{self.title_text}  |  Click and drag to select  |  Press ESC to cancel"
         BAR_HEIGHT, MARGIN = 50, 10
 
         def draw_instruction(mouse_y):
@@ -426,8 +418,6 @@ class CoordinateSelector:
 # StepEditorDialog
 # ===========================================================================
 class StepEditorDialog:
-    """Dialog window to create or edit a single step."""
-
     def __init__(self, parent, step_data=None, on_save=None):
         self.parent = parent
         self.on_save = on_save
@@ -445,7 +435,7 @@ class StepEditorDialog:
         }
         if "shortcut_key" not in self.step_data:
             self.step_data["shortcut_key"] = None
-        self._shortcut_vars = {}   # label -> BooleanVar
+        self._shortcut_vars = {}
         self._build()
         self.win.transient(parent)
         self.win.wait_window()
@@ -460,7 +450,6 @@ class StepEditorDialog:
         frame = tk.Frame(self.win, bg=COLORS["bg"], padx=16, pady=16)
         frame.pack(fill="both", expand=True)
 
-        # Description
         self._lbl(frame, "Step Description (optional)", 0)
         self.desc_var = tk.StringVar(value=self.step_data.get("description", ""))
         tk.Entry(frame, textvariable=self.desc_var, bg=COLORS["card"],
@@ -468,7 +457,6 @@ class StepEditorDialog:
                  font=("Segoe UI", 10), width=48, relief="flat"
                  ).grid(row=1, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 8))
 
-        # Action Type
         self._lbl(frame, "Action Type", 2)
         self.action_var = tk.StringVar(value=self.step_data.get("action", "Click"))
         action_cb = ttk.Combobox(frame, textvariable=self.action_var,
@@ -476,7 +464,6 @@ class StepEditorDialog:
         action_cb.grid(row=3, column=0, sticky="w", padx=8, pady=(2, 8))
         action_cb.bind("<<ComboboxSelected>>", lambda e: self._toggle_fields())
 
-        # Info badges (hidden by default)
         self.enter_info = tk.Label(
             frame,
             text="\u23ce  Simulates pressing the Enter key (no coordinate needed)",
@@ -491,7 +478,6 @@ class StepEditorDialog:
             font=("Segoe UI", 9, "italic"))
         self.shortcut_info.grid(row=3, column=1, columnspan=2, sticky="w", padx=8, pady=(2, 8))
 
-        # Coordinate row
         self._lbl(frame, "Target Coordinate", 4)
         coord_row = tk.Frame(frame, bg=COLORS["bg"])
         coord_row.grid(row=5, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 0))
@@ -516,7 +502,6 @@ class StepEditorDialog:
             cursor="hand2", command=self._pick_coordinate)
         self.pick_btn.pack(side="left", padx=(0, 4))
 
-        # Text entry
         self._lbl(frame, "Text to Type (for Input / Typewrite)", 6)
         self.text_var = tk.StringVar(value=self.step_data.get("text", ""))
         self.text_entry = tk.Entry(
@@ -525,7 +510,6 @@ class StepEditorDialog:
             font=("Segoe UI", 10), width=48, relief="flat")
         self.text_entry.grid(row=7, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 8))
 
-        # Scroll fields
         self._lbl(frame, "Scroll Direction", 8)
         self.scroll_dir_var = tk.StringVar(value=self.step_data.get("scroll_direction", "down"))
         self.scroll_dir_cb = ttk.Combobox(
@@ -541,14 +525,10 @@ class StepEditorDialog:
             font=("Segoe UI", 10), width=6, relief="flat")
         self.scroll_amount_spin.grid(row=9, column=1, sticky="w", padx=8, pady=(2, 4))
 
-        # ----------------------------------------------------------------
-        # Keyboard Shortcut Panel  (row 10, shown only for KB Shortcut)
-        # ----------------------------------------------------------------
         self.shortcut_outer = tk.Frame(frame, bg=COLORS["bg"])
         self.shortcut_outer.grid(row=10, column=0, columnspan=3, sticky="nsew", padx=8, pady=(4, 4))
         self._build_shortcut_panel(self.shortcut_outer)
 
-        # Delay
         self._lbl(frame, "Delay after action (seconds)", 11)
         self.delay_var = tk.DoubleVar(value=self.step_data.get("delay", 0.5))
         tk.Spinbox(
@@ -558,7 +538,6 @@ class StepEditorDialog:
             font=("Segoe UI", 10), width=8, relief="flat"
         ).grid(row=12, column=0, sticky="w", padx=8, pady=(2, 12))
 
-        # Buttons
         btn_row = tk.Frame(frame, bg=COLORS["bg"])
         btn_row.grid(row=13, column=0, columnspan=3, pady=(8, 0))
         tk.Button(btn_row, text="  Save Step  ", bg=COLORS["green"], fg=COLORS["bg"],
@@ -570,19 +549,12 @@ class StepEditorDialog:
 
         self._toggle_fields()
 
-    # ------------------------------------------------------------------
-    # Keyboard Shortcut Panel builder
-    # ------------------------------------------------------------------
     def _build_shortcut_panel(self, parent):
-        """Build a scrollable panel with grouped checkboxes for all shortcuts."""
-        # Header
         tk.Label(parent, text="\u2328\ufe0f  Choose Keyboard Shortcut",
                  bg=COLORS["shortcut_header"], fg=COLORS["shortcut_accent"],
                  font=("Segoe UI", 9, "bold"),
                  anchor="w", padx=8, pady=4
                  ).pack(fill="x")
-
-        # Scrollable canvas
         scroll_canvas = tk.Canvas(
             parent, bg=COLORS["shortcut_bg"],
             highlightthickness=1, highlightbackground=COLORS["border"],
@@ -591,66 +563,44 @@ class StepEditorDialog:
         scroll_canvas.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         scroll_canvas.pack(side="left", fill="both", expand=True)
-
         inner = tk.Frame(scroll_canvas, bg=COLORS["shortcut_bg"])
         scroll_canvas.create_window((0, 0), window=inner, anchor="nw")
-
         currently_selected = self.step_data.get("shortcut_key", None)
-
-        # Track the single selected shortcut
         self._selected_shortcut_label = tk.StringVar(
             value=currently_selected if currently_selected else "")
-
-        # 2-column layout
         left_col = tk.Frame(inner, bg=COLORS["shortcut_bg"])
         left_col.pack(side="left", fill="both", padx=(4, 2), pady=4, anchor="n")
         right_col = tk.Frame(inner, bg=COLORS["shortcut_bg"])
         right_col.pack(side="left", fill="both", padx=(2, 4), pady=4, anchor="n")
         col_frame_list = [left_col, right_col]
-
         for cat_idx, (cat_name, shortcuts) in enumerate(KEYBOARD_SHORTCUTS.items()):
             target_col = col_frame_list[cat_idx % 2]
-
-            # Category header
             tk.Label(target_col, text=cat_name,
-                     bg=COLORS["shortcut_header"],
-                     fg=COLORS["shortcut_accent"],
-                     font=("Segoe UI", 8, "bold"),
-                     anchor="w", padx=6
+                     bg=COLORS["shortcut_header"], fg=COLORS["shortcut_accent"],
+                     font=("Segoe UI", 8, "bold"), anchor="w", padx=6
                      ).pack(fill="x", pady=(6, 2))
-
             for label, keys in shortcuts:
                 var = tk.BooleanVar(value=(currently_selected == label))
                 self._shortcut_vars[label] = var
-
                 cb = tk.Checkbutton(
-                    target_col,
-                    text=label,
-                    variable=var,
-                    bg=COLORS["shortcut_bg"],
-                    fg=COLORS["text"],
+                    target_col, text=label, variable=var,
+                    bg=COLORS["shortcut_bg"], fg=COLORS["text"],
                     selectcolor=COLORS["card"],
                     activebackground=COLORS["shortcut_bg"],
                     activeforeground=COLORS["shortcut_accent"],
-                    font=("Consolas", 8),
-                    anchor="w",
-                    cursor="hand2",
-                    command=lambda lbl=label: self._on_shortcut_check(lbl)
-                )
+                    font=("Consolas", 8), anchor="w", cursor="hand2",
+                    command=lambda lbl=label: self._on_shortcut_check(lbl))
                 cb.pack(fill="x", padx=4, pady=1)
-
         inner.update_idletasks()
         scroll_canvas.configure(scrollregion=scroll_canvas.bbox("all"))
         scroll_canvas.bind_all("<MouseWheel>",
             lambda e: scroll_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
 
     def _on_shortcut_check(self, clicked_label):
-        """Radio-like behaviour: only one shortcut can be checked at a time."""
         for lbl, var in self._shortcut_vars.items():
             if lbl != clicked_label:
                 var.set(False)
 
-    # ------------------------------------------------------------------
     def _toggle_fields(self):
         action = self.action_var.get()
         is_scroll = action == "Scroll"
@@ -658,7 +608,6 @@ class StepEditorDialog:
         is_enter = action == "Press Enter"
         is_shortcut = action == "Keyboard Shortcut"
         no_coord = is_enter or is_shortcut
-
         self.text_entry.config(state="normal" if is_text else "disabled")
         self.scroll_dir_cb.config(state="readonly" if is_scroll else "disabled")
         self.scroll_amount_spin.config(state="normal" if is_scroll else "disabled")
@@ -666,16 +615,12 @@ class StepEditorDialog:
         self.x_entry.config(state=coord_state)
         self.y_entry.config(state=coord_state)
         self.pick_btn.config(state=coord_state)
-
-        # Info badges
         self.enter_info.grid_remove()
         self.shortcut_info.grid_remove()
         if is_enter:
             self.enter_info.grid()
         elif is_shortcut:
             self.shortcut_info.grid()
-
-        # Shortcut panel
         if is_shortcut:
             self.shortcut_outer.grid()
         else:
@@ -699,7 +644,6 @@ class StepEditorDialog:
 
     def _save(self):
         action = self.action_var.get()
-        # Resolve selected shortcut
         if action == "Keyboard Shortcut":
             selected = None
             for lbl, var in self._shortcut_vars.items():
@@ -715,7 +659,6 @@ class StepEditorDialog:
             self.step_data["shortcut_key"] = selected
         else:
             self.step_data["shortcut_key"] = None
-
         self.step_data["action"] = action
         self.step_data["x"] = self.x_var.get()
         self.step_data["y"] = self.y_var.get()
@@ -746,6 +689,9 @@ class TaskCard:
             self.task_data["loop_enabled"] = False
         if "loop_count" not in self.task_data:
             self.task_data["loop_count"] = 1
+        # launcher_icon: {"x": int, "y": int, "enabled": bool}
+        if "launcher_icon" not in self.task_data:
+            self.task_data["launcher_icon"] = {"enabled": False, "x": 0, "y": 0}
         if "steps" in self.task_data and "sections" not in self.task_data:
             self.task_data["sections"] = [
                 {"name": "Section 1", "loop_count": 0, "steps": self.task_data.pop("steps")}]
@@ -754,12 +700,16 @@ class TaskCard:
                 {"name": "Section 1", "loop_count": 0, "steps": []}]
         self._build()
 
+    # ------------------------------------------------------------------
+    # UI Build
+    # ------------------------------------------------------------------
     def _build(self):
         self.card = tk.Frame(
             self.parent_frame, bg=COLORS["card"], bd=0,
             highlightthickness=1, highlightbackground=COLORS["border"])
         self.card.pack(fill="x", padx=10, pady=6)
 
+        # ---- Header row (name + buttons) ----
         header = tk.Frame(self.card, bg=COLORS["card"])
         header.pack(fill="x", padx=10, pady=(8, 4))
 
@@ -806,6 +756,10 @@ class TaskCard:
             font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2",
             command=self._delete_task).pack(side="left", padx=4)
 
+        # ---- Launcher Icon bar (ABOVE loop bar) ----
+        self._build_launcher_bar()
+
+        # ---- Loop bar ----
         loop_bar = tk.Frame(self.card, bg=COLORS["card"])
         loop_bar.pack(fill="x", padx=10, pady=(0, 4))
 
@@ -847,6 +801,7 @@ class TaskCard:
             command=self._add_section)
         self.add_section_btn.pack(side="left", padx=(16, 0))
 
+        # ---- Status ----
         self.status_var = tk.StringVar(value="Ready")
         self.status_lbl = tk.Label(
             self.card, textvariable=self.status_var,
@@ -854,10 +809,110 @@ class TaskCard:
             font=("Segoe UI", 8), anchor="w")
         self.status_lbl.pack(fill="x", padx=10)
 
+        # ---- Sections ----
         self.sections_frame = tk.Frame(self.card, bg=COLORS["step_bg"], pady=4)
         self.sections_frame.pack(fill="x", padx=10, pady=(4, 8))
         self._refresh_ui()
 
+    # ------------------------------------------------------------------
+    # Launcher Icon Bar
+    # ------------------------------------------------------------------
+    def _build_launcher_bar(self):
+        """Build the launcher icon row that sits above the Loop bar."""
+        li = self.task_data["launcher_icon"]
+
+        self.launcher_bar = tk.Frame(self.card, bg=COLORS["launcher_bg"],
+                                     highlightthickness=1,
+                                     highlightbackground=COLORS["launcher_accent"])
+        self.launcher_bar.pack(fill="x", padx=10, pady=(0, 4))
+
+        # Checkbox to enable/disable
+        self.launcher_enabled_var = tk.BooleanVar(value=li.get("enabled", False))
+        tk.Checkbutton(
+            self.launcher_bar,
+            text="\U0001f680  Launcher Icon",
+            variable=self.launcher_enabled_var,
+            bg=COLORS["launcher_bg"], fg=COLORS["launcher_accent"],
+            selectcolor=COLORS["bg"],
+            activebackground=COLORS["launcher_bg"],
+            activeforeground=COLORS["launcher_accent"],
+            font=("Segoe UI", 9, "bold"),
+            command=self._on_launcher_toggle,
+        ).pack(side="left", padx=(6, 0))
+
+        # Info label
+        self.launcher_info_lbl = tk.Label(
+            self.launcher_bar,
+            text="(clicks app icon ONCE before loop starts)",
+            bg=COLORS["launcher_bg"], fg=COLORS["subtext"],
+            font=("Segoe UI", 8, "italic"))
+        self.launcher_info_lbl.pack(side="left", padx=(6, 0))
+
+        # Coordinate display
+        self.launcher_coord_var = tk.StringVar()
+        self._update_launcher_coord_label()
+        self.launcher_coord_lbl = tk.Label(
+            self.launcher_bar,
+            textvariable=self.launcher_coord_var,
+            bg=COLORS["launcher_bg"], fg=COLORS["yellow"],
+            font=("Consolas", 9, "bold"))
+        self.launcher_coord_lbl.pack(side="left", padx=(10, 0))
+
+        # Pick / Change position button
+        self.launcher_pick_btn = tk.Button(
+            self.launcher_bar,
+            text="\U0001f4cd Set Position",
+            bg=COLORS["launcher_accent"], fg=COLORS["bg"],
+            font=("Segoe UI", 8, "bold"), relief="flat", cursor="hand2",
+            command=self._pick_launcher_coord)
+        self.launcher_pick_btn.pack(side="left", padx=(8, 4))
+
+        self._update_launcher_widgets()
+
+    def _update_launcher_coord_label(self):
+        li = self.task_data["launcher_icon"]
+        x, y = li.get("x", 0), li.get("y", 0)
+        if li.get("enabled") and (x != 0 or y != 0):
+            self.launcher_coord_var.set(f"({x}, {y})")
+        elif li.get("enabled"):
+            self.launcher_coord_var.set("Position not set")
+        else:
+            self.launcher_coord_var.set("")
+
+    def _update_launcher_widgets(self):
+        enabled = self.launcher_enabled_var.get()
+        state = "normal" if enabled else "disabled"
+        self.launcher_pick_btn.config(state=state)
+        self._update_launcher_coord_label()
+
+    def _on_launcher_toggle(self):
+        self.task_data["launcher_icon"]["enabled"] = self.launcher_enabled_var.get()
+        self._update_launcher_widgets()
+        self.app_ref.save_data()
+
+    def _pick_launcher_coord(self):
+        """Open fullscreen coordinate picker specifically for the launcher icon."""
+        # Hide main window and card's parent window
+        self.app_ref.root.iconify()
+        self.app_ref.root.after(250, self._do_pick_launcher)
+
+    def _do_pick_launcher(self):
+        def on_coord(x, y):
+            self.app_ref.root.deiconify()
+            if x is not None and y is not None:
+                self.task_data["launcher_icon"]["x"] = x
+                self.task_data["launcher_icon"]["y"] = y
+                self.task_data["launcher_icon"]["enabled"] = True
+                self.launcher_enabled_var.set(True)
+                self._update_launcher_widgets()
+                self.app_ref.save_data()
+        CoordinateSelector(
+            self.app_ref.root, on_coord,
+            title_text="\U0001f680 Select Launcher Icon Position")
+
+    # ------------------------------------------------------------------
+    # Pause / Stop / Status
+    # ------------------------------------------------------------------
     def _toggle_pause(self):
         if self._pause_mgr is None:
             return
@@ -879,6 +934,9 @@ class TaskCard:
         fg = COLORS["yellow"] if (self._pause_mgr and self._pause_mgr.is_paused) else COLORS["subtext"]
         self.status_lbl.config(fg=fg)
 
+    # ------------------------------------------------------------------
+    # Loop settings
+    # ------------------------------------------------------------------
     def _on_loop_toggle(self):
         self.task_data["loop_enabled"] = self.loop_enabled_var.get()
         self.app_ref.save_data()
@@ -892,6 +950,9 @@ class TaskCard:
             self.task_data["loop_count"] = 1
         self.app_ref.save_data()
 
+    # ------------------------------------------------------------------
+    # Sections
+    # ------------------------------------------------------------------
     def _add_section(self):
         name = simpledialog.askstring(
             "New Section", "Enter section name:",
@@ -1077,6 +1138,9 @@ class TaskCard:
                   command=lambda si=sec_idx, st=step_idx: self._move_step(si, st, -1)
                   ).pack(side="right", padx=1)
 
+    # ------------------------------------------------------------------
+    # Step operations
+    # ------------------------------------------------------------------
     def _add_step(self, sec_idx):
         StepEditorDialog(
             self.app_ref.root,
@@ -1128,6 +1192,9 @@ class TaskCard:
                 f"Delete task '{self.task_data.get('name')}'? This cannot be undone."):
             self.app_ref.delete_task(self.index)
 
+    # ------------------------------------------------------------------
+    # Run task
+    # ------------------------------------------------------------------
     def _run_task(self):
         if self.is_running:
             return
@@ -1136,6 +1203,16 @@ class TaskCard:
         if total_steps == 0:
             messagebox.showinfo("No Steps", "This task has no steps to run.")
             return
+
+        # Validate launcher if enabled
+        li = self.task_data["launcher_icon"]
+        if li.get("enabled") and li.get("x", 0) == 0 and li.get("y", 0) == 0:
+            if not messagebox.askyesno(
+                    "Launcher Position Not Set",
+                    "Launcher Icon is enabled but position is (0,0).\n"
+                    "Run anyway without launching?"):
+                return
+
         self._save_loop_settings()
 
         coords = [
@@ -1144,6 +1221,9 @@ class TaskCard:
             for step in sec.get("steps", [])
             if step.get("action") not in ("Press Enter", "Keyboard Shortcut")
         ]
+        # Also add launcher coord to known coords so monitor ignores it
+        if li.get("enabled"):
+            coords.append((li.get("x", 0), li.get("y", 0)))
 
         def on_status(msg):
             self.status_var.set(msg)
@@ -1182,12 +1262,6 @@ class TaskCard:
     # Execute a single step
     # ------------------------------------------------------------------
     def _execute_step(self, step, pm):
-        """
-        Execute one step.
-        pm (AutoPauseManager) is passed explicitly so the step can
-        suppress the mouse-movement detector while the automation
-        intentionally moves the cursor.
-        """
         action = step.get("action", "Click")
         x, y   = step.get("x", 0), step.get("y", 0)
         text   = step.get("text", "")
@@ -1209,8 +1283,6 @@ class TaskCard:
         elif action == "Scroll":
             direction = step.get("scroll_direction", "down")
             amount    = step.get("scroll_amount", 3)
-            # Use pyautogui.scroll/hscroll with explicit x,y so the mouse
-            # does NOT physically move to (0,0) — which triggers the failsafe.
             pm.set_automation_moving(True)
             if direction == "down":
                 pyautogui.scroll(-amount, x=x, y=y)
@@ -1256,6 +1328,7 @@ class TaskCard:
         loop_enabled    = self.task_data.get("loop_enabled", False)
         task_loop_count = max(1, self.task_data.get("loop_count", 1))
         sections        = self.task_data.get("sections", [])
+        li              = self.task_data.get("launcher_icon", {})
 
         def run_section_once(sec, iteration_label=""):
             for step_idx, step in enumerate(sec.get("steps", [])):
@@ -1270,6 +1343,16 @@ class TaskCard:
 
         try:
             pm.automation_running = True
+
+            # ---- LAUNCHER CLICK (once, before anything else) ----
+            if li.get("enabled") and (li.get("x", 0) != 0 or li.get("y", 0) != 0):
+                pm.on_status_update("\U0001f680 Launching app...")
+                pm.set_automation_moving(True)
+                pyautogui.click(li["x"], li["y"])
+                pm.set_automation_moving(False)
+                time.sleep(1.2)   # small pause to let app open/focus
+
+            # ---- MAIN TASK (with or without loop) ----
             if not loop_enabled:
                 for sec in sections:
                     if not run_section_once(sec):
@@ -1295,6 +1378,7 @@ class TaskCard:
                                 sl = f"{iter_lbl}[{sec['name']} Loop {sec_iter}/{sec_loop}] "
                                 if not run_section_once(sec, sl):
                                     raise StopIteration
+
             if not pm.is_stopped:
                 pm.on_status_update("\u2705 Completed successfully")
         except StopIteration:
@@ -1360,7 +1444,8 @@ class AutoFlowApp:
         footer.pack_propagate(False)
         tk.Label(
             footer,
-            text=("Tip: Auto-pause activates on mouse/keyboard activity during automation. "
+            text=("Tip: \U0001f680 Launcher Icon clicks app ONCE before loop. "
+                  "Auto-pause activates on mouse/keyboard activity. "
                   "Use \u23f8 Pause / \u23f9 Stop for manual control."),
             bg=COLORS["sidebar"], fg=COLORS["subtext"],
             font=("Segoe UI", 8)
@@ -1383,6 +1468,7 @@ class AutoFlowApp:
                 "name": name.strip(),
                 "loop_enabled": False,
                 "loop_count": 1,
+                "launcher_icon": {"enabled": False, "x": 0, "y": 0},
                 "sections": [{"name": "Section 1", "loop_count": 0, "steps": []}],
             }
             self.tasks.append(task)
