@@ -111,8 +111,10 @@ COLORS = {
     "shortcut_header": "#1e2030",
 }
 
-pyautogui.FAILSAFE = True
-pyautogui.PAUSE = 0.3
+# Disable PyAutoGUI failsafe to prevent top-left corner from stopping automation.
+# We handle stops ourselves via stop_event.
+pyautogui.FAILSAFE = False
+pyautogui.PAUSE = 0.05
 
 
 # ===========================================================================
@@ -138,10 +140,20 @@ class AutoPauseManager:
         self.pause_timestamp = None
         self.last_mouse_pos = None
         self.automation_running = False
+        # Flag: automation thread sets this True just before moving mouse,
+        # False right after -- so the monitor ignores those movements.
+        self._automation_moving = False
         self._monitor_thread = None
         self._known_automation_coords = []
         self._kb_monitor_thread = None
         self._last_kb_time = 0
+
+    def set_automation_moving(self, moving: bool):
+        """Call with True before automation moves mouse, False after."""
+        self._automation_moving = moving
+        if moving:
+            # Update last known position so monitor doesn't false-trigger
+            self.last_mouse_pos = pyautogui.position()
 
     def start(self, automation_coords=None):
         self.stop_event.clear()
@@ -150,6 +162,7 @@ class AutoPauseManager:
         self.manual_pause_active = False
         self.auto_pause_active = False
         self.automation_running = True
+        self._automation_moving = False
         self._known_automation_coords = automation_coords or []
         self._start_mouse_monitor()
         self._start_keyboard_monitor()
@@ -241,7 +254,9 @@ class AutoPauseManager:
                 current_pos = pyautogui.position()
                 current_time = time.time()
                 if (self.automation_running and not self.pause_event.is_set()
-                        and not self.manual_pause_active and self.last_mouse_pos is not None):
+                        and not self.manual_pause_active
+                        and not self._automation_moving   # <-- skip when automation is moving
+                        and self.last_mouse_pos is not None):
                     dx = current_pos.x - self.last_mouse_pos.x
                     dy = current_pos.y - self.last_mouse_pos.y
                     distance = (dx**2 + dy**2)**0.5
@@ -586,7 +601,6 @@ class StepEditorDialog:
         self._selected_shortcut_label = tk.StringVar(
             value=currently_selected if currently_selected else "")
 
-        col_frame_list = []
         # 2-column layout
         left_col = tk.Frame(inner, bg=COLORS["shortcut_bg"])
         left_col.pack(side="left", fill="both", padx=(4, 2), pady=4, anchor="n")
@@ -594,7 +608,6 @@ class StepEditorDialog:
         right_col.pack(side="left", fill="both", padx=(2, 4), pady=4, anchor="n")
         col_frame_list = [left_col, right_col]
 
-        categories = list(KEYBOARD_SHORTCUTS.keys())
         for cat_idx, (cat_name, shortcuts) in enumerate(KEYBOARD_SHORTCUTS.items()):
             target_col = col_frame_list[cat_idx % 2]
 
@@ -636,9 +649,6 @@ class StepEditorDialog:
         for lbl, var in self._shortcut_vars.items():
             if lbl != clicked_label:
                 var.set(False)
-            else:
-                # Allow unchecking (toggle)
-                pass  # keep whatever the user set
 
     # ------------------------------------------------------------------
     def _toggle_fields(self):
@@ -1039,9 +1049,7 @@ class TaskCard:
                  bg=COLORS["section_bg"], fg=COLORS["subtext"],
                  font=("Consolas", 9), width=12, anchor="w").pack(side="left")
 
-        # For KB shortcuts: show the shortcut label as description
         if action == "Keyboard Shortcut" and step.get("shortcut_key"):
-            # Extract just the key combo part (before " — ")
             sk = step["shortcut_key"].split("  \u2014")[0].strip()
             desc = f"\u2328\ufe0f {sk}"
         else:
@@ -1173,37 +1181,60 @@ class TaskCard:
     # ------------------------------------------------------------------
     # Execute a single step
     # ------------------------------------------------------------------
-    def _execute_step(self, step):
+    def _execute_step(self, step, pm):
+        """
+        Execute one step.
+        pm (AutoPauseManager) is passed explicitly so the step can
+        suppress the mouse-movement detector while the automation
+        intentionally moves the cursor.
+        """
         action = step.get("action", "Click")
         x, y   = step.get("x", 0), step.get("y", 0)
         text   = step.get("text", "")
         delay  = step.get("delay", 0.5)
 
         if action == "Click":
+            pm.set_automation_moving(True)
             pyautogui.click(x, y)
+            pm.set_automation_moving(False)
+
         elif action == "Input":
+            pm.set_automation_moving(True)
             pyautogui.click(x, y)
+            pm.set_automation_moving(False)
             time.sleep(0.2)
             pyautogui.hotkey("ctrl", "a")
             pyautogui.typewrite(text, interval=0.05)
+
         elif action == "Scroll":
             direction = step.get("scroll_direction", "down")
             amount    = step.get("scroll_amount", 3)
-            pyautogui.moveTo(x, y)
-            if direction == "down":  pyautogui.scroll(-amount)
-            elif direction == "up":  pyautogui.scroll(amount)
-            elif direction == "left":  pyautogui.hscroll(-amount)
-            elif direction == "right": pyautogui.hscroll(amount)
+            # Use pyautogui.scroll/hscroll with explicit x,y so the mouse
+            # does NOT physically move to (0,0) — which triggers the failsafe.
+            pm.set_automation_moving(True)
+            if direction == "down":
+                pyautogui.scroll(-amount, x=x, y=y)
+            elif direction == "up":
+                pyautogui.scroll(amount, x=x, y=y)
+            elif direction == "left":
+                pyautogui.hscroll(-amount, x=x, y=y)
+            elif direction == "right":
+                pyautogui.hscroll(amount, x=x, y=y)
+            pm.set_automation_moving(False)
+
         elif action == "Typewrite":
+            pm.set_automation_moving(True)
             pyautogui.click(x, y)
+            pm.set_automation_moving(False)
             time.sleep(0.2)
             pyautogui.typewrite(text, interval=0.08)
+
         elif action == "Press Enter":
             pyautogui.press("enter")
+
         elif action == "Keyboard Shortcut":
             shortcut_label = step.get("shortcut_key")
             if shortcut_label:
-                # Find the key tuple from the shortcuts dictionary
                 keys = None
                 for cat_shortcuts in KEYBOARD_SHORTCUTS.values():
                     for lbl, key_tuple in cat_shortcuts:
@@ -1222,9 +1253,9 @@ class TaskCard:
     # ------------------------------------------------------------------
     def _execute_task(self):
         pm = self._pause_mgr
-        loop_enabled   = self.task_data.get("loop_enabled", False)
+        loop_enabled    = self.task_data.get("loop_enabled", False)
         task_loop_count = max(1, self.task_data.get("loop_count", 1))
-        sections       = self.task_data.get("sections", [])
+        sections        = self.task_data.get("sections", [])
 
         def run_section_once(sec, iteration_label=""):
             for step_idx, step in enumerate(sec.get("steps", [])):
@@ -1232,7 +1263,7 @@ class TaskCard:
                     return False
                 pm.on_status_update(
                     f"{iteration_label}[{sec['name']}] Step {step_idx + 1}: {step.get('action')}")
-                self._execute_step(step)
+                self._execute_step(step, pm)
                 if pm.is_stopped:
                     return False
             return True
@@ -1268,8 +1299,6 @@ class TaskCard:
                 pm.on_status_update("\u2705 Completed successfully")
         except StopIteration:
             pass
-        except pyautogui.FailSafeException:
-            pm.on_status_update("\u274c Stopped: Failsafe triggered (mouse moved to corner)")
         except Exception as e:
             pm.on_status_update(f"\u274c Error: {e}")
         finally:
